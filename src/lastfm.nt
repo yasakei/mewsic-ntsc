@@ -1,0 +1,182 @@
+use strings
+use arrays
+use json
+use http
+use fmt
+use testing
+use "util.nt"
+use "net.nt"
+use "lyrics.nt"
+use "connector.nt"
+
+static const var string lastfm_api = "https://ws.audioscrobbler.com/2.0/"
+
+static const var int lastfm_trusted_lag_ms = 10000
+
+fun lastfm_fetch_player(view string api_key, view string username) -> (FetchError, PlayerState, bool, int) {
+    var state = PlayerState()
+    var url = lastfm_api + "?method=user.getrecenttracks&user=" + util_urlencode(copy(username))
+    url = url + "&api_key=" + util_urlencode(copy(api_key)) + "&limit=2&format=json"
+    var body = lastfm_get(url)
+    if (body == "") {
+        return (connector_error("last.fm request failed"), state, false, -1)
+    }
+    var prev_uts = lastfm_previous_scrobble_uts(copy(body))
+    if (!lastfm_parse_nowplaying(copy(body), state)) {
+        var message = util_json_string(json.get(copy(body), "message"))
+        if (message == "") {
+            message = "last.fm error"
+        }
+        return (connector_error("last.fm: " + message + " (" + json.get(copy(body), "error") + ")"), state, false, -1)
+    }
+    state.duration_ms = lastfm_fetch_duration_ms(copy(api_key), copy(state.artist), copy(state.name))
+    return (connector_error(""), state, true, prev_uts)
+}
+
+fun lastfm_get(view string url) -> string {
+    var body = ""
+    quiet [unused_variable] {
+        try {
+            var resp = http.request_full("GET", copy(url), "", lyrics_options("{}", 8000))
+            body = util_json_string(json.get(resp, "body"))
+        } catch (e) {
+            body = ""
+        }
+    }
+    return body
+}
+
+fun lastfm_previous_scrobble_uts(view string body) -> int {
+    var track = lyrics_json_pointer(copy(body), "/recenttracks/track/1")
+    if (track == "null") {
+        return -1
+    }
+    return lyrics_json_int(json.get(json.get(copy(track), "date"), "uts"))
+}
+
+fun lastfm_measure_lag(int now_secs, int prev_secs) -> int {
+    if (now_secs < prev_secs) {
+        return -1
+    }
+    var lag = (now_secs - prev_secs) * 1000
+    if (lag > lastfm_trusted_lag_ms) {
+        return -1
+    }
+    return lag
+}
+
+fun lastfm_parse_nowplaying(view string body, view mut PlayerState state) -> bool {
+    if (json.has(copy(body), "error")) {
+        return false
+    }
+    var track = lyrics_json_pointer(copy(body), "/recenttracks/track/0")
+    if (track == "null") {
+        return false
+    }
+    var nowplaying = util_json_string(json.get(json.get(copy(track), "@attr"), "nowplaying"))
+    if (nowplaying != "true") {
+        return false
+    }
+    var name = util_json_string(json.get(copy(track), "name"))
+    var artist = lastfm_json_text(json.get(copy(track), "artist"))
+    if (name == "" || artist == "") {
+        return false
+    }
+    var mbid = util_json_string(json.get(copy(track), "mbid"))
+    state.is_playing = true
+    state.progress_ms = 0
+    state.duration_ms = 0
+    state.track_id = mbid + "|" + copy(artist) + "|" + copy(name)
+    state.name = copy(name)
+    state.artist = copy(artist)
+    return true
+}
+
+fun lastfm_fetch_duration_ms(view string api_key, view string artist, view string track) -> int {
+    var url = lastfm_api + "?method=track.getInfo&artist=" + util_urlencode(copy(artist))
+    url = url + "&track=" + util_urlencode(copy(track))
+    url = url + "&api_key=" + util_urlencode(copy(api_key)) + "&format=json"
+    var body = lastfm_get(copy(url))
+    if (body == "") {
+        return -1
+    }
+    var raw = lyrics_json_int(lyrics_json_pointer(copy(body), "/track/duration"))
+    if (raw <= 0) {
+        return -1
+    }
+    if (raw >= 60000) {
+        return raw
+    }
+    return raw * 1000
+}
+
+fun lastfm_json_text(view string value) -> string {
+    if (!strings.starts_with(copy(value), "{")) {
+        return util_json_string(copy(value))
+    }
+    return util_json_string(json.get(copy(value), "#text"))
+}
+
+test lastfm_parses_nowplaying_with_object_artist {
+    var q = util_dquote()
+    var body = "{" + q + "recenttracks" + q + ":{" + q + "track" + q + ":[{" + q + "@attr" + q + ":{" + q + "nowplaying" + q + ":" + q + "true" + q + "},"
+    body = body + q + "artist" + q + ":{" + q + "mbid" + q + ":" + q + "x" + q + "," + q + "#text" + q + ":" + q + "Beyoncé" + q + "},"
+    body = body + q + "name" + q + ":" + q + "A Minecraft Parody" + q + "," + q + "mbid" + q + ":" + q + "track-id" + q + "}]}}"
+    var state = PlayerState()
+    testing.assert_true(lastfm_parse_nowplaying(copy(body), state))
+    testing.assert_true(state.name == "A Minecraft Parody")
+    testing.assert_true(state.artist == "Beyoncé")
+    testing.assert_true(state.is_playing)
+    testing.assert_true(state.track_id == "track-id|Beyoncé|A Minecraft Parody")
+}
+
+test lastfm_parses_nowplaying_with_string_artist {
+    var q = util_dquote()
+    var body = "{" + q + "recenttracks" + q + ":{" + q + "track" + q + ":[{" + q + "@attr" + q + ":{" + q + "nowplaying" + q + ":" + q + "true" + q + "},"
+    body = body + q + "artist" + q + ":" + q + "Plain Artist" + q + "," + q + "name" + q + ":" + q + "Song" + q + "}]}}"
+    var state = PlayerState()
+    testing.assert_true(lastfm_parse_nowplaying(copy(body), state))
+    testing.assert_true(state.artist == "Plain Artist")
+}
+
+test lastfm_last_scrobbled_track_is_not_nowplaying {
+    var q = util_dquote()
+    var body = "{" + q + "recenttracks" + q + ":{" + q + "track" + q + ":[{" + q + "artist" + q + ":{" + q + "#text" + q + ":" + q + "A" + q + "},"
+    body = body + q + "name" + q + ":" + q + "B" + q + "," + q + "date" + q + ":{" + q + "uts" + q + ":" + q + "123" + q + "}}]}}"
+    var state = PlayerState()
+    testing.assert_true(!lastfm_parse_nowplaying(copy(body), state))
+}
+
+test lastfm_api_error_is_reported {
+    var q = util_dquote()
+    var body = "{" + q + "error" + q + ":10," + q + "message" + q + ":" + q + "Invalid API key" + q + "}"
+    var state = PlayerState()
+    testing.assert_true(!lastfm_parse_nowplaying(copy(body), state))
+}
+
+test lastfm_previous_scrobble_uts_is_read_from_second_track {
+    var q = util_dquote()
+    var body = "{" + q + "recenttracks" + q + ":{" + q + "track" + q + ":[{"
+    body = body + q + "@attr" + q + ":{" + q + "nowplaying" + q + ":" + q + "true" + q + "}," + q + "name" + q + ":" + q + "Now" + q + "},"
+    body = body + "{" + q + "name" + q + ":" + q + "Prev" + q + "," + q + "date" + q + ":{" + q + "uts" + q + ":" + q + "1700000000" + q + "}}]}}"
+    testing.assert_true(lastfm_previous_scrobble_uts(copy(body)) == 1700000000)
+
+    var only_now = "{" + q + "recenttracks" + q + ":{" + q + "track" + q + ":[{"
+    only_now = only_now + q + "@attr" + q + ":{" + q + "nowplaying" + q + ":" + q + "true" + q + "}," + q + "name" + q + ":" + q + "Now" + q + "}]}}"
+    testing.assert_true(lastfm_previous_scrobble_uts(copy(only_now)) == -1)
+}
+
+test lastfm_lag_is_measured_from_previous_scrobble_end {
+    testing.assert_true(lastfm_measure_lag(1700000005, 1700000000) == 5000)
+    testing.assert_true(lastfm_measure_lag(1700000100, 1700000000) == -1)
+    testing.assert_true(lastfm_measure_lag(1700000000, 1700000001) == -1)
+    testing.assert_true(lastfm_measure_lag(1700000001, 1700000001) == 0)
+}
+
+test lastfm_duration_seconds_below_a_minute_become_millis {
+    var q = util_dquote()
+    var secs = "{" + q + "track" + q + ":{" + q + "duration" + q + ":" + q + "242" + q + "}}"
+    testing.assert_true(lyrics_json_int(lyrics_json_pointer(copy(secs), "/track/duration")) == 242)
+    var ms = "{" + q + "track" + q + ":{" + q + "duration" + q + ":226000}}"
+    testing.assert_true(lyrics_json_int(lyrics_json_pointer(copy(ms), "/track/duration")) == 226000)
+}

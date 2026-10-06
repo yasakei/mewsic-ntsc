@@ -1,0 +1,568 @@
+use sys
+use strings
+use fmt
+use time
+use os
+use json
+use process
+use testing
+use arrays
+
+static const var string mewsic_version = "1.3.2"
+
+fun util_codepoint(view string ch) -> int {
+    var b0 = strings.char_code(ch, 0)
+    if (b0 < 128) {
+        return b0
+    }
+    var b1 = strings.char_code(ch, 1)
+    if (b0 < 224) {
+        return (b0 - 192) * 64 + (b1 - 128)
+    }
+    var b2 = strings.char_code(ch, 2)
+    if (b0 < 240) {
+        return (b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128)
+    }
+    var b3 = strings.char_code(ch, 3)
+    return (b0 - 240) * 262144 + (b1 - 128) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+}
+
+fun util_first_char(view string s) -> string {
+    var rest = strings.split(s, "")
+    var nl = strings.from_char_code(10)
+    var at = strings.index_of(rest, nl, 0)
+    if (at == -1) {
+        return rest
+    }
+    return strings.substring(rest, 0, at)
+}
+
+fun util_char_count(view string s) -> int {
+    var rest = strings.split(s, "")
+    var nl = strings.from_char_code(10)
+    var n = 0
+    while (!strings.is_empty(rest)) {
+        n = n + 1
+        var at = strings.index_of(rest, nl, 0)
+        if (at == -1) {
+            rest = ""
+        } else {
+            rest = strings.substring(rest, at + 1, -1)
+        }
+    }
+    return n
+}
+
+fun util_capitalize_first(view string s) -> string {
+    var first = util_first_char(s)
+    var rest = strings.substring(s, strings.length(first), -1)
+    return strings.upper(first) + rest
+}
+
+fun util_json_string(view string v) -> string {
+    if (v == "null") {
+        return ""
+    }
+    var q = util_dquote()
+    if (strings.length(v) >= 2 && strings.starts_with(v, q) && strings.ends_with(v, q)) {
+        return strings.substring(v, 1, strings.length(v) - 1)
+    }
+    return copy(v)
+}
+
+fun util_json_is_array(view string text) -> bool {
+    var t = strings.trim(text)
+    if (!strings.starts_with(t, "[")) {
+        return false
+    }
+    return strings.ends_with(t, "]")
+}
+
+fun util_json_array(view string text) -> array[string] {
+    var t = strings.trim(text)
+    if (!strings.starts_with(t, "[") || !strings.ends_with(t, "]")) {
+        throw "expected JSON array"
+    }
+    var array[string] out = arrays.fill("", 0)
+    var inner = strings.substring(t, 1, strings.length(t) - 1)
+    var i = 0
+    var len = strings.length(inner)
+    var depth = 0
+    var start = 0
+    var in_str = false
+    var bs = strings.from_char_code(92)
+    while (i < len) {
+        var c = strings.char_at(inner, i)
+        if (in_str) {
+            if (c == bs) {
+                i = i + 2
+                continue
+            }
+            if (c == util_dquote()) {
+                in_str = false
+            }
+        } else {
+            if (c == util_dquote()) {
+                in_str = true
+            } else {
+                if (c == "[" || c == "{") {
+                    depth = depth + 1
+                } else {
+                    if (c == "]" || c == "}") {
+                        depth = depth - 1
+                    } else {
+                        if (c == "," && depth == 0) {
+                            arrays.push(out, strings.trim(strings.substring(inner, start, i)))
+                            start = i + 1
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    var last = strings.trim(strings.substring(inner, start, -1))
+    if (last != "") {
+        arrays.push(out, last)
+    }
+    return out
+}
+
+fun util_os() -> string {
+    if (os.getenv("OS") == "Windows_NT") {
+        return "windows"
+    }
+    var uname = ""
+    quiet [unused_variable] {
+        try {
+            var out = process.exec_output("uname")
+            uname = util_json_string(json.get(out, "stdout"))
+        } catch (e) {
+            return "linux"
+        }
+    }
+    if (strings.starts_with(uname, "Darwin")) {
+        return "macos"
+    }
+    return "linux"
+}
+
+fun util_arch() -> string {
+    quiet [unused_variable] {
+        try {
+            var out = process.exec_output("uname -m")
+            var arch = strings.trim(util_json_string(json.get(out, "stdout")))
+            if (arch == "") {
+                return "unknown"
+            }
+            return arch
+        } catch (e) {
+            return "unknown"
+        }
+    }
+}
+
+fun util_format_seconds(int total_secs) -> string {
+    var m = total_secs / 60
+    var s = total_secs % 60
+    if (s < 10) {
+        return "" + m + ":0" + s
+    }
+    return "" + m + ":" + s
+}
+
+fun util_urlencode(view string s) -> string {
+    var out = ""
+    var digits = "0123456789ABCDEF"
+    var i = 0
+    var len = strings.length(s)
+    while (i < len) {
+        var code = strings.char_code(s, i)
+        if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122) || (code >= 48 && code <= 57) || code == 45 || code == 95 || code == 46 || code == 126) {
+            out = out + strings.char_at(s, i)
+        } else {
+            out = out + "%" + strings.char_at(digits, code / 16) + strings.char_at(digits, code % 16)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fun util_sanitize_filename(view string s) -> string {
+    var out = ""
+    var rest = strings.split(s, "")
+    var nl = strings.from_char_code(10)
+    while (!strings.is_empty(rest)) {
+        var ch = copy(rest)
+        var at = strings.index_of(rest, nl, 0)
+        if (at != -1) {
+            ch = strings.substring(rest, 0, at)
+            rest = strings.substring(rest, at + 1, -1)
+        } else {
+            rest = ""
+        }
+        if (ch == "-" || ch == "_" || ch == "." || strings.is_alnum(ch) || strings.length(ch) > 1) {
+            out = out + ch
+        } else {
+            out = out + "_"
+        }
+    }
+    return out
+}
+
+fun util_letters_only(view string s) -> string {
+    var out = ""
+    var rest = strings.split(s, "")
+    var nl = strings.from_char_code(10)
+    while (!strings.is_empty(rest)) {
+        var ch = copy(rest)
+        var at = strings.index_of(rest, nl, 0)
+        if (at != -1) {
+            ch = strings.substring(rest, 0, at)
+            rest = strings.substring(rest, at + 1, -1)
+        } else {
+            rest = ""
+        }
+        if (ch != "'" && ch != util_dquote() && ch != "," && ch != ".") {
+            out = out + ch
+        }
+    }
+    return out
+}
+
+fun util_crop(view string s, int n) -> string {
+    var out = ""
+    var rest = strings.split(s, "")
+    var nl = strings.from_char_code(10)
+    var taken = 0
+    while (!strings.is_empty(rest) && taken < n) {
+        var ch = copy(rest)
+        var at = strings.index_of(rest, nl, 0)
+        if (at != -1) {
+            ch = strings.substring(rest, 0, at)
+            rest = strings.substring(rest, at + 1, -1)
+        } else {
+            rest = ""
+        }
+        out = out + ch
+        taken = taken + 1
+    }
+    return out
+}
+
+fun util_civil_from_days(int z) -> string {
+    var zz = z + 719468
+    var era = zz / 146097
+    if (zz < 0) {
+        era = (zz - 146096) / 146097
+    }
+    var doe = zz - era * 146097
+    var yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    var y = yoe + era * 400
+    var doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    var mp = (5 * doy + 2) / 153
+    var d = doy - (153 * mp + 2) / 5 + 1
+    var m = mp + 3
+    if (mp >= 10) {
+        m = mp - 9
+    }
+    var year = y
+    if (m <= 2) {
+        year = y + 1
+    }
+    return fmt.pad_left("" + year, 4, 48) + "-" + util_pad2(m) + "-" + util_pad2(d)
+}
+
+fun util_trunc(float value) -> int {
+    var s = fmt.f64_to_str(value)
+    var dot = strings.index_of(s, ".", 0)
+    if (dot != -1) {
+        s = strings.substring(s, 0, dot)
+    }
+    return fmt.to_int(s)
+}
+
+fun util_dquote() -> string {
+    return strings.from_char_code(34)
+}
+
+fun util_argv0() -> string {
+    var array[string] args = sys.args()
+    if (arrays.length(args) == 0) {
+        return ""
+    }
+    return copy(args[0])
+}
+
+fun util_pad2(int n) -> string {
+    if (n < 10) {
+        return "0" + n
+    }
+    return "" + n
+}
+
+fun util_iso_now_plus(int offset_secs) -> string {
+    var secs = util_trunc(time.now() / 1000.0) + offset_secs
+    var days = secs / 86400
+    var tod = secs % 86400
+    var civil = util_civil_from_days(days)
+    var h = tod / 3600
+    var m = (tod % 3600) / 60
+    var s = tod % 60
+    return civil + "T" + util_pad2(h) + ":" + util_pad2(m) + ":" + util_pad2(s) + "Z"
+}
+
+fun util_decode_html_entities(view string s) -> string {
+    var out = ""
+    var i = 0
+    var len = strings.length(s)
+    while (i < len) {
+        var ch = strings.char_at(s, i)
+        if (ch == "&") {
+            var semi = strings.index_of(s, ";", i + 1)
+            if (semi != -1) {
+                var entity = strings.substring(s, i + 1, semi)
+                var decoded = util_named_entity(entity)
+                if (decoded != "") {
+                    out = out + decoded
+                    i = semi + 1
+                    continue
+                }
+                if (strings.starts_with(entity, "#")) {
+                    var num = strings.substring(entity, 1, -1)
+                    if (fmt.is_int(num)) {
+                        var code = fmt.to_int(num)
+                        if (code >= 0 && code < 128) {
+                            out = out + strings.from_char_code(code)
+                            i = semi + 1
+                            continue
+                        }
+                    }
+                }
+            }
+        }
+        out = out + ch
+        i = i + 1
+    }
+    return out
+}
+
+fun util_named_entity(view string name) -> string {
+    if (name == "amp") {
+        return "&"
+    }
+    if (name == "lt") {
+        return "<"
+    }
+    if (name == "gt") {
+        return ">"
+    }
+    if (name == "quot") {
+        return strings.from_char_code(34)
+    }
+    if (name == "apos") {
+        return "'"
+    }
+    if (name == "nbsp") {
+        return " "
+    }
+    return ""
+}
+
+test util_seconds_format {
+    testing.assert_true(util_format_seconds(0) == "0:00")
+    testing.assert_true(util_format_seconds(137) == "2:17")
+    testing.assert_true(util_format_seconds(3600) == "60:00")
+}
+
+test util_url_encoding {
+    testing.assert_true(util_urlencode("hello world") == "hello%20world")
+    testing.assert_true(util_urlencode("a/b") == "a%2Fb")
+}
+
+test util_entity_decode {
+    testing.assert_true(util_decode_html_entities("&#39;hi&#33;") == "'hi!")
+    testing.assert_true(util_decode_html_entities("a&amp;b&lt;c&gt;") == "a&b<c>")
+}
+
+test util_civil_date {
+    testing.assert_true(util_civil_from_days(19358) == "2023-01-01")
+    testing.assert_true(util_civil_from_days(19723) == "2024-01-01")
+    testing.assert_true(util_civil_from_days(20089) == "2025-01-01")
+    testing.assert_true(util_civil_from_days(20454) == "2026-01-01")
+}
+
+test util_iso_format {
+    var s = util_iso_now_plus(0)
+    testing.assert_true(strings.ends_with(s, "Z"))
+    testing.assert_true(strings.length(s) == 20)
+}
+
+test util_sanitize {
+    testing.assert_true(util_sanitize_filename("A/B:C") == "A_B_C")
+}
+
+test util_letters_only_drops_quotes {
+    var src = "a" + util_dquote() + "b'c,d.e"
+    testing.assert_true(util_letters_only(src) == "abcde")
+}
+
+fun util_lines(view string joined) -> array[string] {
+    var array[string] out = arrays.fill("", 0)
+    var rest = copy(joined)
+    var nl = strings.from_char_code(10)
+    while (!strings.is_empty(rest)) {
+        var at = strings.index_of(rest, nl, 0)
+        if (at == -1) {
+            arrays.push(out, copy(rest))
+            rest = ""
+        } else {
+            arrays.push(out, strings.substring(rest, 0, at))
+            rest = strings.substring(rest, at + 1, -1)
+        }
+    }
+    return out
+}
+
+test util_lines_splits_and_keeps_interior_blanks {
+    testing.assert_true(arrays.length(util_lines("a" + strings.from_char_code(10) + "b")) == 2)
+    testing.assert_true(arrays.length(util_lines("")) == 0)
+    var parts = util_lines("a" + strings.from_char_code(10) + strings.from_char_code(10) + "b")
+    testing.assert_true(arrays.length(parts) == 3)
+    testing.assert_true(parts[1] == "")
+}
+
+fun util_split_all(view string text, string delim) -> array[string] {
+    var array[string] out = arrays.fill("", 0)
+    for (var piece in util_lines(strings.split(text, copy(delim)))) {
+        if (piece != "") {
+            arrays.push(out, copy(piece))
+        }
+    }
+    return out
+}
+
+fun util_json_strip_preamble(view string body) -> string {
+    var text = strings.trim(copy(body))
+    if (strings.starts_with(copy(text), "{") || strings.starts_with(copy(text), "[")) {
+        return copy(body)
+    }
+    var at = strings.index_of(copy(text), strings.from_char_code(10), 0)
+    if (at < 1 || at > 16) {
+        return copy(body)
+    }
+    var nonce = strings.trim(strings.substring(copy(text), 0, at))
+    if (!util_is_short_hex(copy(nonce))) {
+        return copy(body)
+    }
+    var rest = strings.trim(strings.substring(copy(text), at, -1))
+    if (strings.starts_with(copy(rest), "{") || strings.starts_with(copy(rest), "[")) {
+        return copy(rest)
+    }
+    return copy(body)
+}
+
+fun util_is_short_hex(view string text) -> bool {
+    if (text == "" || strings.length(text) > 16) {
+        return false
+    }
+    for (var i = 0; i < strings.length(text); i = i + 1) {
+        var code = strings.char_code(text, i)
+        if (code >= 65 && code <= 70) {
+            code = code + 32
+        }
+        var digit = code >= 48 && code <= 57
+        var letter = code >= 97 && code <= 102
+        if (!digit && !letter) {
+            return false
+        }
+    }
+    return true
+}
+
+test util_json_strips_a_gateway_preamble {
+    testing.assert_true(util_json_strip_preamble("[1, 2]") == "[1, 2]")
+    testing.assert_true(util_json_strip_preamble("{\"a\":1}") == "{\"a\":1}")
+    var with_nonce = "4f6" + strings.from_char_code(10) + strings.from_char_code(10) + "[{\"id\":\"x\"}]"
+    testing.assert_true(util_json_strip_preamble(with_nonce) == "[{\"id\":\"x\"}]")
+    testing.assert_true(util_json_strip_preamble("4f6[1]") == "4f6[1]")
+    var crlf = "4f6" + strings.from_char_code(13) + strings.from_char_code(10) + strings.from_char_code(13) + strings.from_char_code(10) + "[1]"
+    testing.assert_true(util_json_strip_preamble(crlf) == "[1]")
+    testing.assert_true(util_json_strip_preamble("plain text") == "plain text")
+    testing.assert_true(util_json_strip_preamble("zzzz" + strings.from_char_code(10) + strings.from_char_code(10) + "[1]") == "zzzz" + strings.from_char_code(10) + strings.from_char_code(10) + "[1]")
+}
+
+test util_json_array_detection {
+    testing.assert_true(util_json_is_array("[]"))
+    testing.assert_true(util_json_is_array("[1, 2]"))
+    testing.assert_true(util_json_is_array("  [1]  "))
+    testing.assert_true(util_json_is_array("[{\"a\":1}]"))
+    testing.assert_true(!util_json_is_array("{\"a\":1}"))
+    testing.assert_true(!util_json_is_array(""))
+    testing.assert_true(!util_json_is_array("[1"))
+    var long_one = "[{\"id\":\"a\"},{\"id\":\"b\"},{\"id\":\"c\"}]"
+    testing.assert_true(util_json_is_array(long_one))
+}
+
+fun util_json_first_document(view string text) -> string {
+    var int length = strings.length(text)
+    var int depth = 0
+    var int start = -1
+    var bool in_string = false
+    var bool escaped = false
+    var int i = 0
+    while (i < length) {
+        var int code = strings.char_code(text, i)
+        if (in_string) {
+            if (escaped) {
+                escaped = false
+            } else if (code == 92) {
+                escaped = true
+            } else if (code == 34) {
+                in_string = false
+            }
+            i = i + 1
+            continue
+        }
+        if (code == 34) {
+            in_string = true
+            i = i + 1
+            continue
+        }
+        if (code == 123 || code == 91) {
+            if (depth == 0) {
+                start = i
+            }
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if (code == 125 || code == 93) {
+            if (depth > 0) {
+                depth = depth - 1
+                if (depth == 0 && start >= 0) {
+                    return strings.substring(text, start, i + 1)
+                }
+            }
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+test util_json_first_document_ignores_decoration {
+    var nl = strings.from_char_code(10)
+    var cr = strings.from_char_code(13)
+    var q = util_dquote()
+    testing.assert_true(util_json_first_document("[1,2]") == "[1,2]")
+    testing.assert_true(util_json_first_document("[1,2]" + nl + cr + nl + "0") == "[1,2]")
+    testing.assert_true(util_json_first_document("4f6" + nl + nl + "[1]" + nl + "0") == "[1]")
+    var inner = "{" + q + "a" + q + ":" + q + "]" + q + "}"
+    testing.assert_true(util_json_first_document(inner) == inner)
+    var nested = "{" + q + "a" + q + ":{" + q + "b" + q + ":1}," + q + "c" + q + ":[2]}"
+    testing.assert_true(util_json_first_document(nested) == nested)
+    testing.assert_true(util_json_first_document("not json") == "")
+    testing.assert_true(util_json_first_document("[1, 2") == "")
+}

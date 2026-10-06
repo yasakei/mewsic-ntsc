@@ -1,0 +1,104 @@
+use strings
+use arrays
+use testing
+use "config.nt"
+use "state.nt"
+use "util.nt"
+use "romanize.nt"
+
+fun sync_build_status(view ConfigSettings s, view StatePlayback pb, view StateLyricsLine line, view RomanizeTable table) -> (string, string) {
+    var text = copy(line.text)
+    if (s.lyrics.romanize) {
+        text = romanize_romanize(line.text, table)
+    }
+    if (s.view_settings.advanced.enabled) {
+        var rendered = sync_render_template(s.view_settings.advanced.template, pb, line.time, text)
+        return (util_crop(rendered, 128), s.view_settings.advanced.emoji)
+    }
+    var array[string] parts = arrays.fill("", 0)
+    if (s.view_settings.timestamp) {
+        arrays.push(parts, "[" + util_format_seconds(line.time / 1000) + "]")
+    }
+    if (s.view_settings.label) {
+        arrays.push(parts, "Song lyrics -")
+    }
+    arrays.push(parts, strings.replace(text, "♪", "🎶"))
+    var joined = ""
+    var i = 0
+    while (i < arrays.length(parts)) {
+        if (i > 0) {
+            joined = joined + " "
+        }
+        joined = joined + parts[i]
+        i = i + 1
+    }
+    return (util_crop(joined, 128), s.view_settings.emoji)
+}
+fun sync_cropped(string s) -> string {
+    var t = strings.trim(s)
+    var cut = strings.index_of(t, " -", 0)
+    var paren = strings.index_of(t, "(", 0)
+    if (cut == -1) {
+        cut = paren
+    } else {
+        if (paren != -1 && paren < cut) {
+            cut = paren
+        }
+    }
+    if (cut == -1) {
+        return t
+    }
+    return strings.trim(strings.substring(t, 0, cut))
+}
+
+fun sync_render_template(string template, view StatePlayback pb, int line_time, string line_text) -> string {
+    var song = copy(pb.song_name)
+    var author = copy(pb.song_author)
+    var ts = util_format_seconds(line_time / 1000)
+    var out = template
+    out = strings.replace(out, "{lyrics_upper_letters_only}", util_letters_only(strings.upper(line_text)))
+    out = strings.replace(out, "{lyrics_lower_letters_only}", util_letters_only(strings.lower(line_text)))
+    out = strings.replace(out, "{lyrics_letters_only}", util_letters_only(line_text))
+    out = strings.replace(out, "{song_name_upper_cropped}", sync_cropped(strings.upper(song)))
+    out = strings.replace(out, "{song_name_lower_cropped}", sync_cropped(strings.lower(song)))
+    out = strings.replace(out, "{song_name_cropped}", sync_cropped(song))
+    out = strings.replace(out, "{song_author_upper}", strings.upper(author))
+    out = strings.replace(out, "{song_author_lower}", strings.lower(author))
+    out = strings.replace(out, "{lyrics_upper}", strings.upper(line_text))
+    out = strings.replace(out, "{lyrics_lower}", strings.lower(line_text))
+    out = strings.replace(out, "{song_name_upper}", strings.upper(song))
+    out = strings.replace(out, "{song_name_lower}", strings.lower(song))
+    out = strings.replace(out, "{song_name}", song)
+    out = strings.replace(out, "{song_author}", author)
+    out = strings.replace(out, "{lyrics}", line_text)
+    out = strings.replace(out, "{timestamp}", ts)
+    return strings.replace(out, "♪", "🎶")
+}
+
+test sync_simple_status {
+    var s = ConfigSettings()
+    s.view_settings.label = true
+    var pb = StatePlayback()
+    var line = StateLyricsLine()
+    line.time = 62500
+    line.text = "hello"
+    var t = romanize_load("/tmp/mewsic-sync-test")
+    var (text, emoji) = sync_build_status(s, pb, line, t)
+    testing.assert_true(text == "[1:02] Song lyrics - hello")
+    testing.assert_true(emoji == "")
+}
+
+test sync_template_and_crop {
+    var s = ConfigSettings()
+    s.view_settings.advanced.enabled = true
+    s.view_settings.advanced.template = "{lyrics} - {song_name_cropped}"
+    var pb = StatePlayback()
+    pb.song_name = "Song Title - Remaster"
+    var line = StateLyricsLine()
+    line.time = 0
+    line.text = "x"
+    var t = romanize_load("/tmp/mewsic-sync-test")
+    var (text, emoji) = sync_build_status(s, pb, line, t)
+    testing.assert_true(text == "x - Song Title")
+    testing.assert_true(emoji == "")
+}

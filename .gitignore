@@ -1,0 +1,8 @@
+.ntsc/
+build/
+target/
+rust/*/Cargo.lock
+*.log
+*.tmp
+*.swp
+.DS_Store

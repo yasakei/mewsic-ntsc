@@ -1,0 +1,795 @@
+use term
+use io
+use strings
+use arrays
+use "state.nt"
+use "engine.nt"
+use "config.nt"
+use "util.nt"
+use fmt
+use "config.nt"
+use "connector.nt"
+use "autostart.nt"
+use "update.nt"
+use testing
+
+fun tui_supported() -> bool {
+    return term.is_tty()
+}
+
+fun tui_open() -> int {
+    return term.open()
+}
+
+fun tui_close(int ui) {
+    term.restore(ui)
+}
+
+class TuiLine {
+    var array[string] texts
+    var array[int] tones
+    fun init() {
+        this.texts = []
+        this.tones = []
+    }
+}
+
+fun tui_escape(view string code) -> string {
+    return strings.from_char_code(27) + "[" + copy(code)
+}
+
+fun tui_style(int tone) -> string {
+    if (tone == 1) { return tui_escape("32m") }
+    if (tone == 2) { return tui_escape("31m") }
+    if (tone == 3) { return tui_escape("2m") }
+    if (tone == 4) { return tui_escape("33m") }
+    if (tone == 5) { return tui_escape("1;36m") }
+    if (tone == 6) { return tui_escape("1m") }
+    return tui_escape("0m")
+}
+
+fun tui_write(view string text) {
+    io.write(io.stdout(), copy(text))
+    io.flush(io.stdout())
+}
+
+fun tui_nl() -> string {
+    return strings.from_char_code(13) + strings.from_char_code(10)
+}
+
+fun tui_clear() {
+    tui_write(tui_escape("2J") + tui_escape("H"))
+}
+
+fun tui_header(view string title) {
+    tui_clear()
+    tui_write(tui_style(5) + " (=^･ω･^=) mewsic " + tui_style(3) + "· " + copy(title) + tui_style(0) + tui_nl() + tui_nl())
+}
+
+fun tui_footer(view string note) {
+    if (note != "") {
+        tui_write(tui_nl() + tui_style(3) + copy(note) + tui_style(0) + tui_nl())
+    }
+}
+
+fun tui_render_line(view TuiLine line) {
+    var i = 0
+    while (i < arrays.length(line.texts)) {
+        tui_write(tui_style(line.tones[i]) + copy(line.texts[i]) + tui_style(0))
+        i = i + 1
+    }
+    tui_write(tui_nl())
+}
+
+fun tui_render_lines(view array[TuiLine] lines) {
+    for (var line in lines) {
+        tui_render_line(line)
+    }
+}
+
+fun tui_screen(view string title, view array[TuiLine] lines, view string note, view string question, view string input) {
+    tui_header(title)
+    tui_render_lines(lines)
+    if (question != "") {
+        tui_write(tui_nl() + tui_style(5) + copy(question) + tui_style(0) + " ")
+        tui_write(tui_style(6) + copy(input) + tui_style(0) + tui_nl())
+    }
+    tui_footer(note)
+}
+
+fun tui_draw(int ui, view StateAppContext ctx) {
+    if (ui == 0) {
+        return
+    }
+    var pb = engine_snapshot(ctx)
+    var lyrics = copy(pb.current_line)
+    if (lyrics == "") {
+        if (pb.has_lyrics) {
+            lyrics = "waiting for the next line…"
+        } else {
+            lyrics = "fetching lyrics…"
+        }
+    }
+    var song = copy(pb.song_name)
+    if (song == "") {
+        song = "—"
+    }
+    var artist = copy(pb.song_author)
+    if (artist == "") {
+        artist = "—"
+    }
+    var percent = 0.0
+    if (pb.song_duration > 0) {
+        var progress = 0.0
+        progress = pb.song_progress
+        var total = 0.0
+        total = pb.song_duration
+        percent = (progress * 100.0) / total
+    }
+    tui_header("live")
+    var marker = "⏸"
+    if (pb.is_playing) {
+        marker = "▶"
+    }
+    var emoji = ""
+    if (ctx.settings.view_settings.emoji != "") {
+        emoji = copy(ctx.settings.view_settings.emoji) + " "
+    }
+    tui_write(tui_style(5) + "Song   │ " + tui_style(0) + marker + " " + emoji + copy(song) + tui_nl())
+    tui_write(tui_style(5) + "Artist │ " + tui_style(0) + copy(artist) + tui_nl())
+    tui_write(tui_style(5) + "Time   │ " + tui_style(0) + util_format_seconds(pb.song_progress / 1000) + " / " + util_format_seconds(pb.song_duration / 1000) + tui_nl())
+    tui_write(tui_style(5) + "Ping   │ " + tui_style(0) + fmt.i64_to_str(engine_last_latency(ctx)) + " ms" + tui_nl() + tui_nl())
+    tui_write(tui_progress_bar(percent) + tui_nl() + tui_nl())
+    tui_write(tui_style(5) + "Lyrics │ " + tui_style(0) + copy(lyrics) + tui_nl())
+    tui_write(tui_style(5) + "Source │ " + tui_style(0) + config_source_label(ctx.settings.source) + tui_nl())
+    tui_footer("Ctrl+S settings · Ctrl+B web panel · Ctrl+C quit")
+}
+
+fun tui_progress_bar(float percent) -> string {
+    var width = 24
+    var width_float = 0.0
+    width_float = width
+    var filled = util_trunc(percent * width_float / 100.0)
+    if (filled < 0) { filled = 0 }
+    if (filled > width) { filled = width }
+    var label = fmt.i64_to_str(util_trunc(percent)) + "%"
+    return tui_style(5) + "[" + strings.repeat("━", filled) + strings.repeat("─", width - filled) + "] " + label + tui_style(0)
+}
+
+fun tui_poll_action(int ui, int timeout_ms) -> string {
+    if (!term.poll_key(ui, timeout_ms)) {
+        return ""
+    }
+    var code = term.key_code()
+    if (code == "ctrl_c" || code == "escape") {
+        return "quit"
+    }
+    if (code == "character" && term.key_ctrl()) {
+        var typed = term.key_character()
+        if (typed == "s" || typed == "S") {
+            return "settings"
+        }
+        if (typed == "b" || typed == "B") {
+            return "panel"
+        }
+    }
+    return ""
+}
+
+fun tui_line_new() -> TuiLine {
+    return TuiLine()
+}
+
+fun tui_line_add(view mut TuiLine line, string text, int tone) {
+    arrays.push(line.texts, copy(text))
+    arrays.push(line.tones, tone)
+}
+
+fun tui_rich(int ui, string title, array[TuiLine] lines, string note) {
+    if (ui != 0) {
+        tui_screen(title, lines, note, "", "")
+    }
+}
+
+fun tui_flag(bool value) -> string {
+    if (value) {
+        return "yes"
+    }
+    return "no"
+}
+
+fun tui_row(string label, string value, int tone) -> TuiLine {
+    var line = tui_line_new()
+    tui_line_add(line, label, 5)
+    tui_line_add(line, " │ ", 3)
+    tui_line_add(line, value, tone)
+    return line
+}
+
+fun tui_line(string text, int tone) -> TuiLine {
+    var line = tui_line_new()
+    tui_line_add(line, text, tone)
+    return line
+}
+
+fun tui_continue(int ui, string title, array[TuiLine] rows, string note) -> bool {
+    while (true) {
+        tui_screen(title, rows, note + " · Enter to continue", "", "")
+        if (!term.poll_key(ui, 1000)) {
+            continue
+        }
+        var code = term.key_code()
+        if (code == "enter") {
+            return true
+        }
+        if (code == "escape" || code == "ctrl_c") {
+            return false
+        }
+    }
+}
+
+fun tui_ask_text(int ui, string title, array[TuiLine] rows, string note, string question, string dflt, bool masked) -> string {
+    var buffer = copy(dflt)
+    while (true) {
+        var shown = copy(buffer)
+        if (masked) {
+            shown = strings.repeat("*", util_char_count(buffer))
+        }
+        var hint = ""
+        if (dflt != "") {
+            hint = " (default: " + copy(dflt) + ")"
+        }
+        tui_screen(title, rows, note, question + hint, shown)
+        if (!term.poll_key(ui, 1000)) {
+            continue
+        }
+        var code = term.key_code()
+        if (code == "enter") {
+            return buffer
+        }
+        if (code == "escape" || code == "ctrl_c") {
+            return ""
+        }
+        if (code == "backspace") {
+            if (strings.length(buffer) > 0) {
+                buffer = strings.substring(buffer, 0, strings.length(buffer) - 1)
+            }
+            continue
+        }
+        if ((code == "character" || code == "space") && !term.key_ctrl()) {
+            if (code == "space") {
+                buffer = buffer + " "
+            } else {
+                buffer = buffer + term.key_character()
+            }
+        }
+    }
+}
+
+fun tui_ask_yes_no(int ui, string title, array[TuiLine] rows, string note, string question, bool dflt) -> int {
+    while (true) {
+        var hint = "[y/N]"
+        if (dflt) { hint = "[Y/n]" }
+        tui_screen(title, rows, note, question + " " + hint, "")
+        if (!term.poll_key(ui, 1000)) {
+            continue
+        }
+        var code = term.key_code()
+        if (code == "enter") {
+            if (dflt) { return 1 }
+            return 0
+        }
+        if (code == "escape" || code == "ctrl_c") { return -1 }
+        if (code == "character") {
+            var typed = term.key_character()
+            if (typed == "y" || typed == "Y") { return 1 }
+            if (typed == "n" || typed == "N") { return 0 }
+        }
+    }
+}
+
+fun tui_ask_choice(int ui, string title, array[TuiLine] rows, string note, string question, array[string] options, int dflt) -> int {
+    if (arrays.length(options) == 0) {
+        return -1
+    }
+    var cursor = dflt
+    if (cursor < 0) { cursor = 0 }
+    if (cursor >= arrays.length(options)) { cursor = arrays.length(options) - 1 }
+    while (true) {
+        var array[TuiLine] display = []
+        for (var line in rows) { arrays.push(display, line) }
+        arrays.push(display, tui_line("", 0))
+        var i = 0
+        while (i < arrays.length(options)) {
+            arrays.push(display, tui_choice_line(i, options[i], i == cursor, false, false))
+            i = i + 1
+        }
+        tui_screen(title, display, note, question, "")
+        if (!term.poll_key(ui, 1000)) { continue }
+        var code = term.key_code()
+        if (code == "enter") { return cursor }
+        if (code == "escape" || code == "ctrl_c") { return -1 }
+        if (code == "up") { cursor = cursor - 1; if (cursor < 0) { cursor = 0 } }
+        if (code == "down") { cursor = cursor + 1; if (cursor >= arrays.length(options)) { cursor = arrays.length(options) - 1 } }
+        if (code == "home") { cursor = 0 }
+        if (code == "end") { cursor = arrays.length(options) - 1 }
+        if (code == "character") {
+            var digit = fmt.to_int(term.key_character())
+            if (digit > 0 && digit <= arrays.length(options)) { return digit - 1 }
+        }
+    }
+}
+
+fun tui_ask_multi(int ui, string title, array[TuiLine] rows, string note, string question, array[string] options) -> array[int] {
+    var empty = arrays.fill(0, 0)
+    if (arrays.length(options) == 0) { return empty }
+    var cursor = 0
+    var picked = arrays.fill(false, arrays.length(options))
+    while (true) {
+        var array[TuiLine] display = []
+        for (var line in rows) { arrays.push(display, line) }
+        arrays.push(display, tui_line("", 0))
+        var i = 0
+        while (i < arrays.length(options)) {
+            arrays.push(display, tui_choice_line(i, options[i], i == cursor, true, picked[i]))
+            i = i + 1
+        }
+        tui_screen(title, display, note + " · Space toggles · Enter accepts", question, "")
+        if (!term.poll_key(ui, 1000)) { continue }
+        var code = term.key_code()
+        if (code == "enter") {
+            var out = arrays.fill(0, 0)
+            i = 0
+            while (i < arrays.length(options)) {
+                if (picked[i]) { arrays.push(out, i) }
+                i = i + 1
+            }
+            return out
+        }
+        if (code == "escape" || code == "ctrl_c") { return empty }
+        if (code == "up") { cursor = cursor - 1; if (cursor < 0) { cursor = 0 } }
+        if (code == "down") { cursor = cursor + 1; if (cursor >= arrays.length(options)) { cursor = arrays.length(options) - 1 } }
+        if (code == "space" || (code == "character" && term.key_character() == " ")) { picked[cursor] = !picked[cursor] }
+        if (code == "character" && term.key_character() == "a") { picked = arrays.fill(true, arrays.length(options)) }
+        if (code == "character" && term.key_character() == "n") { picked = arrays.fill(false, arrays.length(options)) }
+    }
+}
+
+fun tui_ask_number(int ui, string title, array[TuiLine] rows, string note, string question, int dflt, int min, int max) -> int {
+    var buffer = fmt.i64_to_str(dflt)
+    while (true) {
+        tui_screen(title, rows, note, question + " [" + fmt.i64_to_str(min) + "–" + fmt.i64_to_str(max) + "]", buffer)
+        if (!term.poll_key(ui, 1000)) { continue }
+        var code = term.key_code()
+        if (code == "enter") {
+            var value = dflt
+            if (fmt.is_int(buffer)) { value = fmt.to_int(buffer) }
+            if (value < min) { value = min }
+            if (value > max) { value = max }
+            return value
+        }
+        if (code == "escape" || code == "ctrl_c") { return -1 }
+        if (code == "backspace") {
+            if (strings.length(buffer) > 0) { buffer = strings.substring(buffer, 0, strings.length(buffer) - 1) }
+        }
+        if (code == "character" && strings.is_digit(term.key_character()) && !term.key_ctrl()) {
+            buffer = buffer + term.key_character()
+        }
+    }
+}
+
+fun tui_choice_line(int index, string label, bool cursor, bool checkable, bool checked) -> TuiLine {
+    var line = tui_line_new()
+    if (cursor) { tui_line_add(line, "▸ ", 5) } else { tui_line_add(line, "  ", 0) }
+    tui_line_add(line, fmt.i64_to_str(index + 1) + ". ", 3)
+    if (checkable) {
+        if (checked) { tui_line_add(line, "[x] ", 1) } else { tui_line_add(line, "[ ] ", 3) }
+    }
+    var label_tone = 0
+    if (cursor) { label_tone = 5 }
+    tui_line_add(line, label, label_tone)
+    return line
+}
+test bridge_string_keeps_spaces {
+    tui_line("a b c", 0)
+    var plain = "keep my spaces"
+    testing.assert_true(plain == "keep my spaces")
+}
+
+fun tui_wizard(view mut StateAppContext ctx, int ui) -> bool {
+    var settings = ctx.settings
+
+    var welcome = tui_line_new()
+    tui_line_add(welcome, "", 0)
+    tui_line_add(welcome, "(=^･ω･^=) mewsic", 5)
+    tui_line_add(welcome, "  terminal setup", 0)
+    var welcome_more = tui_line_new()
+    tui_line_add(welcome_more, "Configure the app without a browser.", 3)
+    var welcome_step = tui_line_new()
+    tui_line_add(welcome_step, "●", 1)
+    tui_line_add(welcome_step, "  source · token · view · timing · autostart", 0)
+    var array[TuiLine] welcome_rows = []
+    arrays.push(welcome_rows, welcome)
+    arrays.push(welcome_rows, welcome_more)
+    arrays.push(welcome_rows, welcome_step)
+    if (!tui_continue(ui, "Welcome", welcome_rows, "")) {
+        return false
+    }
+
+    var step_one = tui_line_new()
+    tui_line_add(step_one, "Step 1", 3)
+    tui_line_add(step_one, "  ", 0)
+    tui_line_add(step_one, "Music source", 6)
+    var step_one_hint = tui_line_new()
+    tui_line_add(step_one_hint, "Where mewsic reads the current track from.", 3)
+    var source_spotify = tui_line_new()
+    tui_line_add(source_spotify, "1", 5)
+    tui_line_add(source_spotify, "  Spotify via Discord", 0)
+    var source_spotify_hint = tui_line_new()
+    tui_line_add(source_spotify_hint, "   Uses the Discord → Spotify connection.", 3)
+    var source_lastfm = tui_line_new()
+    tui_line_add(source_lastfm, "2", 5)
+    tui_line_add(source_lastfm, "  Last.fm / YouTube Music", 0)
+    var source_lastfm_hint = tui_line_new()
+    tui_line_add(source_lastfm_hint, "   Follows your scrobbles.", 3)
+    var array[TuiLine] source_rows = []
+    arrays.push(source_rows, step_one)
+    arrays.push(source_rows, step_one_hint)
+    arrays.push(source_rows, source_spotify)
+    arrays.push(source_rows, source_spotify_hint)
+    arrays.push(source_rows, source_lastfm)
+    arrays.push(source_rows, source_lastfm_hint)
+    var array[string] sources = arrays.fill("", 0)
+    arrays.push(sources, "spotify")
+    arrays.push(sources, "lastfm")
+    var source_default = 0
+    if (settings.source == ConfigSource.Lastfm) {
+        source_default = 1
+    }
+    var picked = tui_ask_choice(ui, "Source · Step 1/4", source_rows, "Esc cancels", "Choose your music source:", copy(sources), source_default)
+    if (picked < 0) {
+        return false
+    }
+    settings.source = config_source_parse(sources[picked])
+    if (settings.source != ConfigSource.Spotify) {
+        var api_key = tui_ask_text(ui, "Source · Step 2/4", tui_summary_rows(ctx), "Esc cancels", "Last.fm API key:", copy(settings.lastfm.api_key), false)
+        if (api_key == "") {
+            return false
+        }
+        settings.lastfm.api_key = copy(api_key)
+        var username = tui_ask_text(ui, "Source · Step 2/4", tui_summary_rows(ctx), "Esc cancels", "Last.fm username:", copy(settings.lastfm.username), false)
+        if (username == "") {
+            return false
+        }
+        settings.lastfm.username = copy(username)
+    }
+
+    if (settings.source == ConfigSource.Spotify) {
+        var token_rows = tui_token_rows(ctx, "")
+        var token = tui_ask_text(ui, "Account · Step 3/4", token_rows, "Esc cancels", "Enter your Discord token:", "", true)
+        if (token == "") {
+            return false
+        }
+        var tries = 0
+        var invalid = ""
+        while (token != "" && !connector_validate_token(copy(token)) && tries < 5) {
+            tries = tries + 1
+            invalid = copy(token)
+            token = tui_ask_text(ui, "Account · Step 3/4", tui_token_rows(ctx, copy(invalid)), "Esc cancels", "That token was rejected. Try again:", "", true)
+        }
+        settings.token = copy(token)
+    }
+
+    settings.view_settings.timestamp = tui_ask_yes_no(ui, "View · Step 4/4", tui_summary_rows(ctx), "Esc cancels", "Show the timestamp?", settings.view_settings.timestamp) == 1
+    settings.view_settings.label = tui_ask_yes_no(ui, "View · Step 4/4", tui_summary_rows(ctx), "Esc cancels", "Show the Song lyrics label?", settings.view_settings.label) == 1
+    var emoji = tui_ask_text(ui, "View · Step 4/4", tui_summary_rows(ctx), "Esc cancels", "Status emoji (blank for none):", copy(settings.view_settings.emoji), false)
+    settings.view_settings.emoji = copy(emoji)
+    settings.view_settings.auto_clear = tui_ask_yes_no(ui, "View · Step 4/4", tui_summary_rows(ctx), "Esc cancels", "Clear the status when playback stops?", settings.view_settings.auto_clear) == 1
+    settings.view_settings.advanced.enabled = tui_ask_yes_no(ui, "View · Step 4/4", tui_summary_rows(ctx), "Esc cancels", "Use a custom status template?", settings.view_settings.advanced.enabled) == 1
+    if (settings.view_settings.advanced.enabled) {
+        var advanced_emoji = tui_ask_text(ui, "View · Step 4/4", tui_summary_rows(ctx), "Esc cancels", "Template emoji:", copy(settings.view_settings.advanced.emoji), false)
+        settings.view_settings.advanced.emoji = copy(advanced_emoji)
+        var template = tui_ask_text(ui, "View · Step 4/4", tui_summary_rows(ctx), "Esc cancels", "Template ({song}, {artist}, {lyrics}):", copy(settings.view_settings.advanced.template), false)
+        settings.view_settings.advanced.template = copy(template)
+    }
+    var offset = tui_ask_number(ui, "Timing", tui_summary_rows(ctx), "Esc cancels", "Send the line this many ms early:", settings.timing.send_time_offset, 0, 10000)
+    if (offset >= 0) {
+        settings.timing.send_time_offset = offset
+    }
+    settings.timing.enable_autooffset = tui_ask_yes_no(ui, "Timing", tui_summary_rows(ctx), "Esc cancels", "Measure the delay automatically?", settings.timing.enable_autooffset) == 1
+    if (settings.timing.enable_autooffset) {
+        var autooffset = tui_ask_number(ui, "Timing", tui_summary_rows(ctx), "Esc cancels", "Auto-offset samples to average:", settings.timing.autooffset, 1, 64)
+        if (autooffset >= 0) {
+            settings.timing.autooffset = autooffset
+        }
+    }
+    settings.update.auto_start = tui_ask_yes_no(ui, "Maintenance", tui_summary_rows(ctx), "Esc cancels", "Start mewsic when you log in?", settings.update.auto_start) == 1
+    config_save(settings, copy(ctx.config_dir))
+    autostart_apply(copy(ctx.config_dir), settings.update.auto_start)
+    tui_summary_screen(ui, ctx)
+    return true
+}
+
+fun tui_summary_rows(view mut StateAppContext ctx) -> array[TuiLine] {
+    var s = ctx.settings
+    var array[TuiLine] rows = []
+    arrays.push(rows, tui_row("Source", config_source_label(s.source), 0))
+    arrays.push(rows, tui_row("Token", tui_masked(s.token), if_token(s.token)))
+    arrays.push(rows, tui_row("Last.fm", tui_masked(s.lastfm.api_key), if_token(s.lastfm.api_key)))
+    arrays.push(rows, tui_row("User", s.lastfm.username, 0))
+    arrays.push(rows, tui_row("Timestamp", tui_flag(s.view_settings.timestamp), 0))
+    arrays.push(rows, tui_row("Label", tui_flag(s.view_settings.label), 0))
+    arrays.push(rows, tui_row("Emoji", s.view_settings.emoji, 0))
+    arrays.push(rows, tui_row("Offset", fmt.i64_to_str(s.timing.send_time_offset) + " ms", 0))
+    arrays.push(rows, tui_row("Autostart", tui_flag(s.update.auto_start), 0))
+    return rows
+}
+
+fun tui_token_rows(view mut StateAppContext ctx, string rejected) -> array[TuiLine] {
+    var token_rows = tui_summary_rows(ctx)
+    if (rejected != "") {
+        arrays.push(token_rows, tui_row("Rejected", "that token did not validate", 2))
+    }
+    return token_rows
+}
+
+fun tui_masked(string secret) -> string {
+    if (secret == "") {
+        return "not set"
+    }
+    return "••••"
+}
+
+fun if_token(string secret) -> int {
+    if (secret == "") {
+        return 3
+    }
+    return 1
+}
+
+fun tui_summary_screen(int ui, view mut StateAppContext ctx) {
+    var heading = tui_line_new()
+    tui_line_add(heading, "Settings saved to ", 0)
+    tui_line_add(heading, copy(ctx.config_dir), 5)
+    var array[TuiLine] rows = []
+    arrays.push(rows, heading)
+    tui_continue(ui, "All set", rows, "Enter to finish")
+}
+
+fun tui_settings_editor(view mut StateAppContext ctx, int ui) {
+    while (true) {
+        var array[TuiLine] menu = []
+        arrays.push(menu, tui_menu_line("1", "Account (Discord token)", " "))
+        arrays.push(menu, tui_menu_line("2", "Source (Spotify / Last.fm)", if_source(ctx)))
+        arrays.push(menu, tui_menu_line("3", "View (timestamp, label, advanced)", tui_flag(ctx.settings.view_settings.timestamp)))
+        arrays.push(menu, tui_menu_line("4", "Timing (offset, autooffset)", fmt.i64_to_str(ctx.settings.timing.send_time_offset) + " ms"))
+        arrays.push(menu, tui_menu_line("5", "Autostart", tui_flag(ctx.settings.update.auto_start)))
+        arrays.push(menu, tui_menu_line("6", "Update (manual check)", ctx.state.update.message))
+        arrays.push(menu, tui_menu_line("7", "Lyrics (providers, custom)", tui_provider_summary(ctx)))
+        arrays.push(menu, tui_menu_line("8", "Privacy (telemetry)", tui_flag(ctx.settings.usage.enabled)))
+        var hint = tui_line_new()
+        tui_line_add(hint, "Esc or Enter saves and exits.", 3)
+        arrays.push(menu, hint)
+        var choice = tui_ask_text(ui, "Settings editor", menu, "Type a number", "Choose 1-8 or Enter to save/exit:", "", false)
+        if (choice == "") {
+            config_save(ctx.settings, copy(ctx.config_dir))
+            return
+        }
+        if (tui_edit_account(ctx, ui, copy(choice))) {
+            continue
+        }
+        if (tui_edit_source(ctx, ui, copy(choice))) {
+            continue
+        }
+        if (tui_edit_view(ctx, ui, copy(choice))) {
+            continue
+        }
+        if (tui_edit_timing(ctx, ui, copy(choice))) {
+            continue
+        }
+        if (tui_edit_autostart(ctx, ui, copy(choice))) {
+            continue
+        }
+        if (tui_edit_update(ctx, ui, copy(choice))) {
+            continue
+        }
+        if (tui_edit_lyrics(ctx, ui, copy(choice))) {
+            continue
+        }
+        if (tui_edit_privacy(ctx, ui, copy(choice))) {
+            continue
+        }
+        if (choice != "1" && choice != "2" && choice != "3" && choice != "4" && choice != "5" && choice != "6" && choice != "7" && choice != "8") {
+            var array[TuiLine] warn_rows = []
+            arrays.push(warn_rows, tui_line_new_warning("Unknown choice — pick 1-8 or press Enter."))
+            tui_continue(ui, "Settings editor", warn_rows, "")
+        }
+        config_save(ctx.settings, copy(ctx.config_dir))
+    }
+}
+
+fun tui_menu_line(string number, string label, string value) -> TuiLine {
+    var line = tui_line_new()
+    tui_line_add(line, number, 5)
+    tui_line_add(line, "  " + label, 0)
+    if (value != "" && value != " ") {
+        tui_line_add(line, "  · " + value, 3)
+    }
+    return line
+}
+
+fun tui_line_new_warning(string text) -> TuiLine {
+    var line = tui_line_new()
+    tui_line_add(line, text, 4)
+    return line
+}
+
+fun if_source(view mut StateAppContext ctx) -> string {
+    if (ctx.settings.source == ConfigSource.Spotify) {
+        return "spotify"
+    }
+    return "lastfm"
+}
+
+fun tui_provider_summary(view mut StateAppContext ctx) -> string {
+    var text = ""
+    for (var id in ctx.settings.lyrics.providers) {
+        if (text != "") {
+            text = text + ", "
+        }
+        text = text + config_builtin_provider_label(copy(id))
+    }
+    if (ctx.settings.lyrics.romanize) {
+        text = text + " · romanized"
+    }
+    if (text == "") {
+        return "none"
+    }
+    return text
+}
+
+fun tui_edit_account(view mut StateAppContext ctx, int ui, string choice) -> bool {
+    if (choice != "1" && choice != "account") {
+        return false
+    }
+    var token = tui_ask_text(ui, "Account", tui_summary_rows(ctx), "Esc cancels", "Enter your Discord token:", "", true)
+    if (token != "") {
+        ctx.settings.token = copy(token)
+    }
+    return true
+}
+
+fun tui_edit_source(view mut StateAppContext ctx, int ui, string choice) -> bool {
+    if (choice != "2" && choice != "source") {
+        return false
+    }
+    var array[string] sources = arrays.fill("", 0)
+    arrays.push(sources, "spotify")
+    arrays.push(sources, "lastfm")
+    var picked = tui_ask_choice(ui, "Source", tui_summary_rows(ctx), "Esc cancels", "Choose your music source:", copy(sources), if_lastfm(ctx))
+    if (picked < 0) {
+        return true
+    }
+    ctx.settings.source = config_source_parse(sources[picked])
+    if (ctx.settings.source != ConfigSource.Spotify) {
+        var api_key = tui_ask_text(ui, "Source", tui_summary_rows(ctx), "Esc cancels", "Last.fm API key:", copy(ctx.settings.lastfm.api_key), false)
+        if (api_key != "") {
+            ctx.settings.lastfm.api_key = copy(api_key)
+        }
+        var username = tui_ask_text(ui, "Source", tui_summary_rows(ctx), "Esc cancels", "Last.fm username:", copy(ctx.settings.lastfm.username), false)
+        if (username != "") {
+            ctx.settings.lastfm.username = copy(username)
+        }
+    }
+    return true
+}
+
+fun if_lastfm(view mut StateAppContext ctx) -> int {
+    if (ctx.settings.source == ConfigSource.Spotify) {
+        return 0
+    }
+    return 1
+}
+
+fun tui_edit_view(view mut StateAppContext ctx, int ui, string choice) -> bool {
+    if (choice != "3" && choice != "view") {
+        return false
+    }
+    ctx.settings.view_settings.timestamp = tui_ask_yes_no(ui, "View", tui_summary_rows(ctx), "Esc cancels", "Show the timestamp?", ctx.settings.view_settings.timestamp) == 1
+    ctx.settings.view_settings.label = tui_ask_yes_no(ui, "View", tui_summary_rows(ctx), "Esc cancels", "Show the Song lyrics label?", ctx.settings.view_settings.label) == 1
+    var emoji = tui_ask_text(ui, "View", tui_summary_rows(ctx), "Esc cancels", "Status emoji (blank for none):", copy(ctx.settings.view_settings.emoji), false)
+    ctx.settings.view_settings.emoji = copy(emoji)
+    ctx.settings.view_settings.auto_clear = tui_ask_yes_no(ui, "View", tui_summary_rows(ctx), "Esc cancels", "Clear the status when playback stops?", ctx.settings.view_settings.auto_clear) == 1
+    ctx.settings.view_settings.advanced.enabled = tui_ask_yes_no(ui, "View", tui_summary_rows(ctx), "Esc cancels", "Use a custom status template?", ctx.settings.view_settings.advanced.enabled) == 1
+    if (ctx.settings.view_settings.advanced.enabled) {
+        var advanced_emoji = tui_ask_text(ui, "View", tui_summary_rows(ctx), "Esc cancels", "Template emoji:", copy(ctx.settings.view_settings.advanced.emoji), false)
+        ctx.settings.view_settings.advanced.emoji = copy(advanced_emoji)
+        var template = tui_ask_text(ui, "View", tui_summary_rows(ctx), "Esc cancels", "Template ({song}, {artist}, {lyrics}):", copy(ctx.settings.view_settings.advanced.template), false)
+        ctx.settings.view_settings.advanced.template = copy(template)
+    }
+    return true
+}
+
+fun tui_edit_timing(view mut StateAppContext ctx, int ui, string choice) -> bool {
+    if (choice != "4" && choice != "timing") {
+        return false
+    }
+    var offset = tui_ask_number(ui, "Timing", tui_summary_rows(ctx), "Esc cancels", "Send the line this many ms early:", ctx.settings.timing.send_time_offset, 0, 10000)
+    if (offset >= 0) {
+        ctx.settings.timing.send_time_offset = offset
+    }
+    ctx.settings.timing.enable_autooffset = tui_ask_yes_no(ui, "Timing", tui_summary_rows(ctx), "Esc cancels", "Measure the delay automatically?", ctx.settings.timing.enable_autooffset) == 1
+    var autooffset = tui_ask_number(ui, "Timing", tui_summary_rows(ctx), "Esc cancels", "Auto-offset samples to average:", ctx.settings.timing.autooffset, 1, 64)
+    if (autooffset >= 0) {
+        ctx.settings.timing.autooffset = autooffset
+    }
+    return true
+}
+
+fun tui_edit_autostart(view mut StateAppContext ctx, int ui, string choice) -> bool {
+    if (choice != "5" && choice != "autostart") {
+        return false
+    }
+    var enabled = tui_ask_yes_no(ui, "Autostart", tui_summary_rows(ctx), "Esc cancels", "Start mewsic when you log in?", ctx.settings.update.auto_start)
+    if (enabled >= 0) {
+        ctx.settings.update.auto_start = enabled == 1
+        autostart_apply(copy(ctx.config_dir), ctx.settings.update.auto_start)
+    }
+    return true
+}
+
+fun tui_edit_update(view mut StateAppContext ctx, int ui, string choice) -> bool {
+    if (choice != "6" && choice != "update") {
+        return false
+    }
+    var message = update_check_only(ctx)
+    var array[TuiLine] rows = []
+    arrays.push(rows, tui_line_new_warning(copy(message)))
+    tui_continue(ui, "Update", rows, "Enter to continue")
+    return true
+}
+
+fun tui_edit_lyrics(view mut StateAppContext ctx, int ui, string choice) -> bool {
+    if (choice != "7" && choice != "lyrics") {
+        return false
+    }
+    var array[string] options = arrays.fill("", 0)
+    arrays.push(options, "lrclib")
+    arrays.push(options, "netease")
+    arrays.push(options, "qqmusic")
+    arrays.push(options, "custom")
+    var picked = tui_ask_multi(ui, "Lyrics", tui_summary_rows(ctx), "Esc cancels", "Pick lyrics providers (space toggles):", copy(options))
+    if (arrays.length(picked) == 0) {
+        return true
+    }
+    var array[string] chosen = arrays.fill("", 0)
+    for (var index in picked) {
+        if (index >= 0 && index < arrays.length(options)) {
+            arrays.push(chosen, copy(options[index]))
+        }
+    }
+    ctx.settings.lyrics.providers = chosen
+    for (var id in ctx.settings.lyrics.providers) {
+        if (id == "custom") {
+            ctx.settings.lyrics.has_custom = true
+            var name = tui_ask_text(ui, "Lyrics", tui_summary_rows(ctx), "Esc cancels", "Provider name:", copy(ctx.settings.lyrics.custom.name), false)
+            ctx.settings.lyrics.custom.name = copy(name)
+            var url = tui_ask_text(ui, "Lyrics", tui_summary_rows(ctx), "Esc cancels", "URL template (URL-quoted):", copy(ctx.settings.lyrics.custom.url), false)
+            ctx.settings.lyrics.custom.url = copy(url)
+            var api_key = tui_ask_text(ui, "Lyrics", tui_summary_rows(ctx), "Esc cancels", "API key (optional):", copy(ctx.settings.lyrics.custom.api_key), false)
+            ctx.settings.lyrics.custom.api_key = copy(api_key)
+            var json_path = tui_ask_text(ui, "Lyrics", tui_summary_rows(ctx), "Esc cancels", "JSON path to the lyrics:", copy(ctx.settings.lyrics.custom.json_path), false)
+            ctx.settings.lyrics.custom.json_path = copy(json_path)
+        }
+    }
+    ctx.settings.lyrics.romanize = tui_ask_yes_no(ui, "Lyrics", tui_summary_rows(ctx), "Esc cancels", "Romanize lyrics?", ctx.settings.lyrics.romanize) == 1
+    return true
+}
+
+fun tui_edit_privacy(view mut StateAppContext ctx, int ui, string choice) -> bool {
+    if (choice != "8" && choice != "privacy" && choice != "telemetry") {
+        return false
+    }
+    ctx.settings.usage.enabled = tui_ask_yes_no(ui, "Privacy", tui_summary_rows(ctx), "Esc cancels", "Send anonymous usage stats?", ctx.settings.usage.enabled) == 1
+    return true
+}

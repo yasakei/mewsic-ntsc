@@ -1,0 +1,763 @@
+use arrays
+use strings
+use testing
+use "../translit_text.nt"
+use "internal/aliases_direct.nt"
+use "internal/dict.nt"
+
+enum JptomewJapaneseCheck {
+    No,
+    Possibly,
+    Yes
+}
+class JptomewTranslitResult {
+    var string hiragana
+    var string romaji
+    fun init(string hira, string latin) {
+        this.hiragana = hira
+        this.romaji = latin
+    }
+}
+
+class JptomewRenderState {
+    var string buf
+    var string result_hira
+    var string result_rom
+    var int prev_kind
+    var bool cap_next
+    var bool cap_sent
+    var bool cap_sent_done
+    fun init() {
+        this.buf = ""
+        this.result_hira = ""
+        this.result_rom = ""
+        this.prev_kind = 3
+        this.cap_next = false
+        this.cap_sent = false
+        this.cap_sent_done = false
+    }
+}
+
+static const var int jptomew_script_hiragana = 0
+static const var int jptomew_script_katakana = 1
+static const var int jptomew_script_ideograph = 2
+static const var int jptomew_script_space = 3
+static const var int jptomew_script_leading = 4
+static const var int jptomew_script_trailing = 5
+static const var int jptomew_script_joining = 6
+static const var int jptomew_script_numeric = 7
+static const var int jptomew_script_other = 8
+
+fun jptomew_is_ideograph(view string ch) -> bool {
+    var code = translit_codepoint(ch)
+    return (code >= 19968 && code <= 40879) || (code >= 13312 && code <= 19903)
+}
+
+fun jptomew_is_resolvable_ideograph(view string ch) -> bool {
+    var code = translit_codepoint(ch)
+    return (code >= 19968 && code <= 40959) || (code >= 13312 && code <= 19903)
+}
+
+fun jptomew_is_kana(view string ch) -> bool {
+    var code = translit_codepoint(ch)
+    return (code >= 12353 && code <= 12438) || (code >= 12449 && code <= 12538) || code == 12450
+}
+
+fun jptomew_is_fullwidth_punct(view string ch) -> bool {
+    var code = translit_codepoint(ch)
+    return (code >= 65281 && code <= 65295) || (code >= 65306 && code <= 65311) || (code >= 65339 && code <= 65343) || (code >= 65371 && code <= 65408)
+}
+
+fun jptomew_nfkc_char(int code) -> string {
+    if (code == 12288) { return " " }
+    if (code >= 65281 && code <= 65374) {
+        return strings.from_char_code(code - 65248)
+    }
+    if (code == 9312) { return "1" }
+    if (code == 9313) { return "2" }
+    if (code == 9314) { return "3" }
+    if (code == 9315) { return "4" }
+    if (code == 9316) { return "5" }
+    if (code == 9317) { return "6" }
+    if (code == 9318) { return "7" }
+    if (code == 9319) { return "8" }
+    if (code == 9320) { return "9" }
+    if (code == 9321) { return "10" }
+    return ""
+}
+
+fun jptomew_normalize(view string text) -> array[string] {
+    var array[string] out = arrays.fill("", 0)
+    var array[string] input = translit_chars(text)
+    var i = 0
+    while (i < arrays.length(input)) {
+        var string ch = copy(input[i])
+        if (translit_codepoint(ch) == 12293) {
+            var run = 1
+            while (i + run < arrays.length(input) && translit_codepoint(input[i + run]) == 12293) {
+                run = run + 1
+            }
+            var previous = arrays.length(out) - run
+            if (previous >= 0) {
+                var string repeated = copy(out[previous])
+                arrays.push(out, repeated)
+            }
+            i = i + run
+            continue
+        }
+        var resolved = jptomew_alias(ch)
+        if (jptomew_is_fullwidth_punct(ch)) {
+            arrays.push(out, copy(resolved))
+        } else {
+            var expanded = jptomew_nfkc_char(translit_codepoint(resolved))
+            if (expanded == "") {
+                arrays.push(out, copy(resolved))
+            } else {
+                var array[string] expanded_chars = translit_chars(expanded)
+                var j = 0
+                while (j < arrays.length(expanded_chars)) {
+                    arrays.push(out, copy(expanded_chars[j]))
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fun jptomew_classify(view string ch) -> int {
+    var code = translit_codepoint(ch)
+    if (code >= 12353 && code <= 12438) { return jptomew_script_hiragana }
+    if ((code >= 12449 && code <= 12538) || code == 12450) { return jptomew_script_katakana }
+    if ((code >= 19968 && code <= 40879) || (code >= 13312 && code <= 19903)) { return jptomew_script_ideograph }
+    if (code == 12540) { return jptomew_script_katakana }
+    if (translit_is_space(ch)) { return jptomew_script_space }
+    if (ch == "・") { return jptomew_script_space }
+    if (ch == "「" || ch == "『" || ch == "〈" || ch == "《" || ch == "【" || ch == "〔" || ch == "〖" || ch == "〘" || ch == "〝" || ch == "＃" || ch == "（" || ch == "［" || ch == "｛") {
+        return jptomew_script_leading
+    }
+    if (ch == "。" || ch == "、" || ch == "」" || ch == "』" || ch == "〉" || ch == "》" || ch == "】" || ch == "〕" || ch == "〗" || ch == "〙" || ch == "〟" || ch == "：" || ch == "；" || ch == "！" || ch == "？" || ch == "）" || ch == "］" || ch == "｝") {
+        return jptomew_script_trailing
+    }
+    if (ch == "〜" || ch == "＿" || ch == "(" || ch == "[" || ch == "{" || ch == "_") {
+        return jptomew_script_joining
+    }
+    if (code >= 48 && code <= 57) { return jptomew_script_numeric }
+    if (ch == "." || ch == ",") { return jptomew_script_other }
+    if (ch == ":" || ch == ";" || ch == "!" || ch == "?" || ch == "#" || ch == ")" || ch == "]" || ch == "}") {
+        return jptomew_script_trailing
+    }
+    return jptomew_script_other
+}
+
+fun jptomew_is_japanese_punct(view string ch) -> bool {
+    return ch == "、" || ch == "。" || ch == "「" || ch == "」" || ch == "『" || ch == "』" || ch == "〜" || ch == "・" || ch == "〈" || ch == "〉" || ch == "《" || ch == "》" || ch == "【" || ch == "〔" || ch == "〗" || ch == "〖" || ch == "〘" || ch == "〙" || ch == "〝" || ch == "〟" || ch == "：" || ch == "；" || ch == "！" || ch == "？" || ch == "＃" || ch == "）" || ch == "］" || ch == "｝" || ch == "（" || ch == "［" || ch == "｛"
+}
+
+fun jptomew_kind_after(int kind) -> bool {
+    return kind != jptomew_script_leading && kind != jptomew_script_joining
+}
+
+fun jptomew_kind_before(int kind) -> bool {
+    return kind != jptomew_script_trailing && kind != jptomew_script_joining
+}
+
+fun jptomew_kind_is_japanese(int kind) -> bool {
+    return kind == jptomew_script_hiragana || kind == jptomew_script_katakana || kind == jptomew_script_ideograph
+}
+
+fun jptomew_punct_to_latin(view string ch) -> string {
+    if (ch == "、") { return "," }
+    if (ch == "。") { return "." }
+    if (ch == "「" || ch == "」" || ch == "』" || ch == "〝" || ch == "〟" || ch == "『") { return strings.from_char_code(34) }
+    if (ch == "〈") { return "<" }
+    if (ch == "〉") { return ">" }
+    if (ch == "《") { return "«" }
+    if (ch == "》") { return "»" }
+    if (ch == "【" || ch == "〖") { return "[" }
+    if (ch == "】" || ch == "〗") { return "]" }
+    if (ch == "〔" || ch == "〘" || ch == "（") { return "(" }
+    if (ch == "〕" || ch == "〙" || ch == "）") { return ")" }
+    if (ch == "〜") { return "~" }
+    if (ch == "：") { return ":" }
+    if (ch == "；") { return ";" }
+    if (ch == "！") { return "!" }
+    if (ch == "？") { return "?" }
+    if (ch == "＃") { return "#" }
+    if (ch == "［") { return "[" }
+    if (ch == "］") { return "]" }
+    if (ch == "｛") { return "{" }
+    if (ch == "｝") { return "}" }
+    return ""
+}
+
+fun jptomew_triggers_capitalization(view string ch) -> bool {
+    return ch == "." || ch == "!" || ch == "?"
+}
+
+fun jptomew_manage_trailing_space(view string text, bool want_space) -> string {
+    if (text == "" || strings.ends_with(text, "\n")) { return copy(text) }
+    if (strings.ends_with(text, " ")) {
+        if (!want_space) { return strings.substring(text, 0, strings.length(text) - 1) }
+        return copy(text)
+    }
+    if (want_space) { return copy(text) + " " }
+    return copy(text)
+}
+
+fun jptomew_alphanumeric(int code) -> bool {
+    return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+}
+
+fun jptomew_capitalize_first(view string text) -> string {
+    var array[string] chars = translit_chars(text)
+    var out = ""
+    var changed = false
+    var i = 0
+    while (i < arrays.length(chars)) {
+        var string ch = copy(chars[i])
+        if (!changed && jptomew_alphanumeric(translit_codepoint(ch))) {
+            var code = translit_codepoint(ch)
+            if (jptomew_alphanumeric(code) && code >= 97 && code <= 122) { ch = strings.upper(ch) }
+            changed = true
+        }
+        out = out + ch
+        i = i + 1
+    }
+    return out
+}
+
+fun jptomew_kata_to_hira_char(view string ch) -> string {
+    if (ch == "ァ") { return "ぁ" }
+    if (ch == "ア") { return "あ" }
+    if (ch == "ィ") { return "ぃ" }
+    if (ch == "イ") { return "い" }
+    if (ch == "ゥ") { return "ぅ" }
+    if (ch == "ウ") { return "う" }
+    if (ch == "ェ") { return "ぇ" }
+    if (ch == "エ") { return "え" }
+    if (ch == "ォ") { return "ぉ" }
+    if (ch == "オ") { return "お" }
+    if (ch == "カ") { return "か" }
+    if (ch == "ガ") { return "が" }
+    if (ch == "キ") { return "き" }
+    if (ch == "ギ") { return "ぎ" }
+    if (ch == "ク") { return "く" }
+    if (ch == "グ") { return "ぐ" }
+    if (ch == "ケ") { return "け" }
+    if (ch == "ゲ") { return "げ" }
+    if (ch == "コ") { return "こ" }
+    if (ch == "ゴ") { return "ご" }
+    if (ch == "サ") { return "さ" }
+    if (ch == "ザ") { return "ざ" }
+    if (ch == "シ") { return "し" }
+    if (ch == "ジ") { return "じ" }
+    if (ch == "ス") { return "す" }
+    if (ch == "ズ") { return "ず" }
+    if (ch == "セ") { return "せ" }
+    if (ch == "ゼ") { return "ぜ" }
+    if (ch == "ソ") { return "そ" }
+    if (ch == "ゾ") { return "ぞ" }
+    if (ch == "タ") { return "た" }
+    if (ch == "ダ") { return "だ" }
+    if (ch == "チ") { return "ち" }
+    if (ch == "ヂ") { return "ぢ" }
+    if (ch == "ッ") { return "っ" }
+    if (ch == "ツ") { return "つ" }
+    if (ch == "ヅ") { return "づ" }
+    if (ch == "テ") { return "て" }
+    if (ch == "デ") { return "で" }
+    if (ch == "ト") { return "と" }
+    if (ch == "ド") { return "ど" }
+    if (ch == "ナ") { return "な" }
+    if (ch == "ニ") { return "に" }
+    if (ch == "ヌ") { return "ぬ" }
+    if (ch == "ネ") { return "ね" }
+    if (ch == "ノ") { return "の" }
+    if (ch == "ハ") { return "は" }
+    if (ch == "バ") { return "ば" }
+    if (ch == "パ") { return "ぱ" }
+    if (ch == "ヒ") { return "ひ" }
+    if (ch == "ビ") { return "び" }
+    if (ch == "ピ") { return "ぴ" }
+    if (ch == "フ") { return "ふ" }
+    if (ch == "ブ") { return "ぶ" }
+    if (ch == "プ") { return "ぷ" }
+    if (ch == "ヘ") { return "へ" }
+    if (ch == "ベ") { return "べ" }
+    if (ch == "ペ") { return "ぺ" }
+    if (ch == "ホ") { return "ほ" }
+    if (ch == "ボ") { return "ぼ" }
+    if (ch == "ポ") { return "ぽ" }
+    if (ch == "マ") { return "ま" }
+    if (ch == "ミ") { return "み" }
+    if (ch == "ム") { return "む" }
+    if (ch == "メ") { return "め" }
+    if (ch == "モ") { return "も" }
+    if (ch == "ャ") { return "ゃ" }
+    if (ch == "ヤ") { return "や" }
+    if (ch == "ュ") { return "ゅ" }
+    if (ch == "ユ") { return "ゆ" }
+    if (ch == "ョ") { return "ょ" }
+    if (ch == "ヨ") { return "よ" }
+    if (ch == "ラ") { return "ら" }
+    if (ch == "リ") { return "り" }
+    if (ch == "ル") { return "る" }
+    if (ch == "レ") { return "れ" }
+    if (ch == "ロ") { return "ろ" }
+    if (ch == "ヮ") { return "ゎ" }
+    if (ch == "ワ") { return "わ" }
+    if (ch == "ヰ") { return "ゐ" }
+    if (ch == "ヱ") { return "ゑ" }
+    if (ch == "ヲ") { return "を" }
+    if (ch == "ン") { return "ん" }
+    if (ch == "ヴ") { return "ゔ" }
+    if (ch == "ヵ") { return "ゕ" }
+    if (ch == "ヶ") { return "ゖ" }
+    if (ch == "ヷ") { return "ゔぁ" }
+    if (ch == "ヸ") { return "ゔぃ" }
+    if (ch == "ヹ") { return "ゔぇ" }
+    if (ch == "ヺ") { return "ゔぉ" }
+    return copy(ch)
+}
+fun jptomew_to_hiragana(view string text) -> string {
+    var array[string] chars = translit_chars(text)
+    var out = ""
+    for (var ch in chars) { out = out + jptomew_kata_to_hira_char(ch) }
+    return out
+}
+
+fun jptomew_combined(view string a, view string b) -> string {
+    if (a == "き" && b == "ゃ") { return "kya" }
+    if (a == "き" && b == "ゅ") { return "kyu" }
+    if (a == "き" && b == "ょ") { return "kyo" }
+    if (a == "ぎ" && b == "ゃ") { return "gya" }
+    if (a == "ぎ" && b == "ゅ") { return "gyu" }
+    if (a == "ぎ" && b == "ょ") { return "gyo" }
+    if (a == "し" && b == "ゃ") { return "sha" }
+    if (a == "し" && b == "ゅ") { return "shu" }
+    if (a == "し" && b == "ょ") { return "sho" }
+    if (a == "じ" && b == "ゃ") { return "ja" }
+    if (a == "じ" && b == "ゅ") { return "ju" }
+    if (a == "じ" && b == "ょ") { return "jo" }
+    if (a == "ち" && b == "ゃ") { return "cha" }
+    if (a == "ち" && b == "ゅ") { return "chu" }
+    if (a == "ち" && b == "ょ") { return "cho" }
+    if (a == "に" && b == "ゃ") { return "nya" }
+    if (a == "に" && b == "ゅ") { return "nyu" }
+    if (a == "に" && b == "ょ") { return "nyo" }
+    if (a == "ひ" && b == "ゃ") { return "hya" }
+    if (a == "ひ" && b == "ゅ") { return "hyu" }
+    if (a == "ひ" && b == "ょ") { return "hyo" }
+    if (a == "び" && b == "ゃ") { return "bya" }
+    if (a == "び" && b == "ゅ") { return "byu" }
+    if (a == "び" && b == "ょ") { return "byo" }
+    if (a == "ぴ" && b == "ゃ") { return "pya" }
+    if (a == "ぴ" && b == "ゅ") { return "pyu" }
+    if (a == "ぴ" && b == "ょ") { return "pyo" }
+    if (a == "み" && b == "ゃ") { return "mya" }
+    if (a == "み" && b == "ゅ") { return "myu" }
+    if (a == "み" && b == "ょ") { return "myo" }
+    if (a == "り" && b == "ゃ") { return "rya" }
+    if (a == "り" && b == "ゅ") { return "ryu" }
+    if (a == "り" && b == "ょ") { return "ryo" }
+    if (a == "ふ" && b == "ぁ") { return "fa" }
+    if (a == "ふ" && b == "ぃ") { return "fi" }
+    if (a == "ふ" && b == "ぇ") { return "fe" }
+    if (a == "ふ" && b == "ぉ") { return "fo" }
+    return ""
+}
+
+fun jptomew_single(view string ch) -> string {
+    if (ch == "あ") { return "a" }
+    if (ch == "い") { return "i" }
+    if (ch == "う") { return "u" }
+    if (ch == "え") { return "e" }
+    if (ch == "お") { return "o" }
+    if (ch == "か") { return "ka" }
+    if (ch == "き") { return "ki" }
+    if (ch == "く") { return "ku" }
+    if (ch == "け") { return "ke" }
+    if (ch == "こ") { return "ko" }
+    if (ch == "さ") { return "sa" }
+    if (ch == "し") { return "shi" }
+    if (ch == "す") { return "su" }
+    if (ch == "せ") { return "se" }
+    if (ch == "そ") { return "so" }
+    if (ch == "た") { return "ta" }
+    if (ch == "ち") { return "chi" }
+    if (ch == "つ") { return "tsu" }
+    if (ch == "て") { return "te" }
+    if (ch == "と") { return "to" }
+    if (ch == "な") { return "na" }
+    if (ch == "に") { return "ni" }
+    if (ch == "ぬ") { return "nu" }
+    if (ch == "ね") { return "ne" }
+    if (ch == "の") { return "no" }
+    if (ch == "は") { return "ha" }
+    if (ch == "ひ") { return "hi" }
+    if (ch == "ふ") { return "fu" }
+    if (ch == "へ") { return "he" }
+    if (ch == "ほ") { return "ho" }
+    if (ch == "ま") { return "ma" }
+    if (ch == "み") { return "mi" }
+    if (ch == "む") { return "mu" }
+    if (ch == "め") { return "me" }
+    if (ch == "も") { return "mo" }
+    if (ch == "や") { return "ya" }
+    if (ch == "ゆ") { return "yu" }
+    if (ch == "よ") { return "yo" }
+    if (ch == "ら") { return "ra" }
+    if (ch == "り") { return "ri" }
+    if (ch == "る") { return "ru" }
+    if (ch == "れ") { return "re" }
+    if (ch == "ろ") { return "ro" }
+    if (ch == "わ") { return "wa" }
+    if (ch == "ゐ") { return "wi" }
+    if (ch == "ゑ") { return "we" }
+    if (ch == "を") { return "wo" }
+    if (ch == "ん") { return "n" }
+    if (ch == "が") { return "ga" }
+    if (ch == "ぎ") { return "gi" }
+    if (ch == "ぐ") { return "gu" }
+    if (ch == "げ") { return "ge" }
+    if (ch == "ご") { return "go" }
+    if (ch == "ざ") { return "za" }
+    if (ch == "じ") { return "ji" }
+    if (ch == "ず") { return "zu" }
+    if (ch == "ぜ") { return "ze" }
+    if (ch == "ぞ") { return "zo" }
+    if (ch == "だ") { return "da" }
+    if (ch == "ぢ") { return "ji" }
+    if (ch == "づ") { return "zu" }
+    if (ch == "で") { return "de" }
+    if (ch == "ど") { return "do" }
+    if (ch == "ば") { return "ba" }
+    if (ch == "び") { return "bi" }
+    if (ch == "ぶ") { return "bu" }
+    if (ch == "べ") { return "be" }
+    if (ch == "ぼ") { return "bo" }
+    if (ch == "ぱ") { return "pa" }
+    if (ch == "ぴ") { return "pi" }
+    if (ch == "ぷ") { return "pu" }
+    if (ch == "ぺ") { return "pe" }
+    if (ch == "ぽ") { return "po" }
+    if (ch == "ゔ") { return "vu" }
+    if (ch == "ゕ") { return "ka" }
+    if (ch == "ゖ") { return "ke" }
+    if (ch == "ぁ") { return "a" }
+    if (ch == "ぃ") { return "i" }
+    if (ch == "ぅ") { return "u" }
+    if (ch == "ぇ") { return "e" }
+    if (ch == "ぉ") { return "o" }
+    if (ch == "ゎ") { return "wa" }
+    return ""
+}
+
+fun jptomew_last_vowel(view string text) -> string {
+    var i = strings.length(text) - 1
+    while (i >= 0) {
+        var c = strings.char_at(text, i)
+        if (c == "a" || c == "e" || c == "i" || c == "o" || c == "u") { return c }
+        i = i - 1
+    }
+    return ""
+}
+
+fun jptomew_kana_romaji(view string text) -> string {
+    var hira = jptomew_to_hiragana(text)
+    var array[string] chars = translit_chars(hira)
+    var out = ""
+    var last_vowel = ""
+    var i = 0
+    while (i < arrays.length(chars)) {
+        var string ch = copy(chars[i])
+        if (ch == "ー") {
+            out = out + last_vowel
+            i = i + 1
+            continue
+        }
+        if (i + 1 < arrays.length(chars)) {
+            var combo = jptomew_combined(ch, chars[i + 1])
+            if (combo != "") {
+                out = out + combo
+                last_vowel = jptomew_last_vowel(combo)
+                i = i + 2
+                continue
+            }
+        }
+        if (ch == "っ") {
+            if (i + 1 < arrays.length(chars)) {
+                var next_rom = jptomew_single(chars[i + 1])
+                if (next_rom != "") {
+                    out = out + strings.substring(next_rom, 0, 1)
+                    i = i + 1
+                    continue
+                }
+            }
+            out = out + "tsu"
+            i = i + 1
+            continue
+        }
+        if (ch == "ん") {
+            var apostrophe = false
+            if (i + 1 < arrays.length(chars)) {
+                var next_rom = jptomew_single(chars[i + 1])
+                if (next_rom != "") {
+                    var first = strings.substring(next_rom, 0, 1)
+                    apostrophe = first == "a" || first == "e" || first == "i" || first == "o" || first == "u" || first == "y"
+                }
+            }
+            if (apostrophe) { out = out + "n'" } else { out = out + "n" }
+            i = i + 1
+            continue
+        }
+        var rom = jptomew_single(ch)
+        if (rom == "") {
+            out = out + ch
+        } else {
+            out = out + rom
+            last_vowel = jptomew_last_vowel(rom)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fun jptomew_spans_kana(view array[string] chars, int start, int count) -> bool {
+    var i = start
+    while (i < start + count) {
+        if (!jptomew_is_resolvable_ideograph(chars[i])) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fun jptomew_tail_matches(view string tail, view string next) -> bool {
+    if (tail == "a") { return strings.contains("あぁっわゎ", next) }
+    if (tail == "i") { return strings.contains("いぃっゐ", next) }
+    if (tail == "u") { return strings.contains("うぅっ", next) }
+    if (tail == "e") { return strings.contains("えぇっゑ", next) }
+    if (tail == "o") { return strings.contains("おぉっ", next) }
+    if (tail == "k") { return strings.contains("かゕきくけゖこっ", next) }
+    if (tail == "g") { return strings.contains("がぎぐげごっ", next) }
+    if (tail == "s") { return strings.contains("さしすせそっ", next) }
+    if (tail == "z" || tail == "j") { return strings.contains("ざじずぜぞっ", next) }
+    if (tail == "t") { return strings.contains("たちつてとっ", next) }
+    if (tail == "d") { return strings.contains("だぢづでどっ", next) }
+    if (tail == "c") { return strings.contains("ちっ", next) }
+    if (tail == "n") { return strings.contains("なにぬねのん", next) }
+    if (tail == "h") { return strings.contains("はひふへほっ", next) }
+    if (tail == "b") { return strings.contains("ばびぶべぼっ", next) }
+    if (tail == "f") { return strings.contains("ふっ", next) }
+    if (tail == "p") { return strings.contains("ぱぴぷぺぽっ", next) }
+    if (tail == "m") { return strings.contains("まみむめも", next) }
+    if (tail == "y") { return strings.contains("ゃやゅゆょよ", next) }
+    if (tail == "r") { return strings.contains("らりるれろ", next) }
+    if (tail == "w") { return strings.contains("わゐゑゎをっ", next) }
+    if (tail == "v") { return next == "ゔ" }
+    return false
+}
+
+fun jptomew_choose(view array[string] chars, int start, int count, view string before, view string records) -> (bool, string, int, bool) {
+    if (records == "~" || records == "E||") { return (false, "", 0, false) }
+    var ordinal = 0
+    var at = 0
+    while (at <= strings.length(records)) {
+        var end = strings.index_of(records, ";", at)
+        if (end < 0) { end = strings.length(records) }
+        var record = strings.substring(records, at, end)
+        var first = strings.index_of(record, "|", 0)
+        var second = strings.index_of(record, "|", first + 1)
+        var kind = strings.substring(record, 0, first)
+        var hira = strings.substring(record, first + 1, second)
+        var extra = strings.substring(record, second + 1, -1)
+        if (kind == "C") {
+            if (start + count < arrays.length(chars) && jptomew_tail_matches(extra, chars[start + count])) {
+                return (true, hira + chars[start + count], count + 1, true)
+            }
+        } else if (kind == "X") {
+            if (strings.contains(before, extra)) { return (true, hira, count, jptomew_spans_kana(chars, start, count)) }
+        } else if (kind == "P") {
+            return (true, hira, count, jptomew_spans_kana(chars, start, count))
+        }
+        if (end >= strings.length(records)) { break }
+        at = end + 1
+        ordinal = ordinal + 1
+    }
+    return (false, "", 0, false)
+}
+
+fun jptomew_resolve(view array[string] chars, int start, view string before) -> (bool, string, int, bool) {
+    var best_found = false
+    var best_hira = ""
+    var best_count = 0
+    var best_continues = false
+    var key = ""
+    var count = 0
+    while (start + count < arrays.length(chars) && count < 8) {
+        key = key + chars[start + count]
+        count = count + 1
+        var records = jptomew_dictionary(key)
+        if (records == "~") { break }
+        var (found, hira, consumed, continues) = jptomew_choose(chars, start, count, before, records)
+        if (found) {
+            best_found = true
+            best_hira = hira
+            best_count = consumed
+            best_continues = continues
+        }
+    }
+    return (best_found, best_hira, best_count, best_continues)
+}
+
+fun jptomew_flush(view mut JptomewRenderState state) {
+    if (state.buf == "") {
+        return
+    }
+    var hira = jptomew_to_hiragana(state.buf)
+    state.result_hira = copy(state.result_hira) + hira
+    var rom = jptomew_kana_romaji(hira)
+    if (state.cap_next) {
+        rom = jptomew_capitalize_first(rom)
+        state.cap_next = false
+    }
+    if (state.cap_sent && !state.cap_sent_done) {
+        state.result_rom = jptomew_capitalize_first(state.result_rom)
+        state.cap_sent_done = true
+    }
+    state.result_rom = jptomew_manage_trailing_space(state.result_rom, jptomew_kind_after(state.prev_kind))
+    state.result_rom = copy(state.result_rom) + rom
+    state.buf = ""
+    state.prev_kind = jptomew_script_hiragana
+}
+
+fun jptomew_transliterate(view string text) -> JptomewTranslitResult {
+    var array[string] chars = jptomew_normalize(text)
+    var JptomewRenderState state = JptomewRenderState()
+    var i = 0
+    while (i < arrays.length(chars)) {
+        var string ch = copy(chars[i])
+        var kind = jptomew_classify(ch)
+        if (kind == jptomew_script_hiragana || kind == jptomew_script_katakana) {
+            state.buf = copy(state.buf) + ch
+            i = i + 1
+            continue
+        }
+        if (kind == jptomew_script_ideograph) {
+            var (found, hira, consumed, continues) = jptomew_resolve(chars, i, state.buf)
+            jptomew_flush(state)
+            if (found) {
+                state.buf = copy(state.buf) + hira
+                if (!continues) { jptomew_flush(state) }
+                i = i + consumed
+            } else {
+                state.result_hira = copy(state.result_hira) + ch
+                state.result_rom = copy(state.result_rom) + ch
+                state.prev_kind = jptomew_script_ideograph
+                i = i + 1
+            }
+            continue
+        }
+        if (kind == jptomew_script_space) {
+            jptomew_flush(state)
+            state.result_hira = copy(state.result_hira) + ch
+            if (ch == "・") { state.result_rom = copy(state.result_rom) + " " } else { state.result_rom = copy(state.result_rom) + ch }
+            state.prev_kind = jptomew_script_space
+            i = i + 1
+            continue
+        }
+        jptomew_flush(state)
+        state.result_hira = copy(state.result_hira) + ch
+        var jp = jptomew_is_japanese_punct(ch)
+        if (jptomew_kind_is_japanese(state.prev_kind) || jp) {
+            state.result_rom = jptomew_manage_trailing_space(state.result_rom, jptomew_kind_after(state.prev_kind) && jptomew_kind_before(kind))
+        }
+        var latin = jptomew_punct_to_latin(ch)
+        if (jp && kind == jptomew_script_other) {
+            state.result_rom = copy(state.result_rom) + jptomew_nfkc_char(translit_codepoint(ch))
+        } else if (latin != "") {
+            state.result_rom = copy(state.result_rom) + latin
+            var first = strings.substring(latin, 0, 1)
+            if (jptomew_triggers_capitalization(first) && kind != jptomew_script_joining) {
+                state.cap_next = true
+                state.cap_sent = true
+            }
+        } else {
+            state.result_rom = copy(state.result_rom) + ch
+        }
+        state.prev_kind = kind
+        i = i + 1
+    }
+    jptomew_flush(state)
+    return JptomewTranslitResult(copy(state.result_hira), copy(state.result_rom))
+}
+
+fun jptomew_romaji(view string text) -> string {
+    var JptomewTranslitResult r = jptomew_transliterate(text)
+    return r.romaji
+}
+
+fun jptomew_hiragana(view string text) -> string {
+    var JptomewTranslitResult r = jptomew_transliterate(text)
+    return r.hiragana
+}
+
+fun jptomew_detect(view string text) -> int {
+    var array[string] chars = translit_chars(text)
+    for (var ch in chars) {
+        var code = translit_codepoint(ch)
+        if ((code >= 12353 && code <= 12438) || (code >= 12449 && code <= 12538)) { return JptomewJapaneseCheck.Yes }
+        if (code >= 19968 && code <= 40879) { return JptomewJapaneseCheck.Possibly }
+    }
+    return JptomewJapaneseCheck.No
+}
+
+fun jptomew_is_japanese(view string text) -> bool {
+    return jptomew_detect(text) != JptomewJapaneseCheck.No
+}
+
+test jptomew_transliterate_sentence {
+    var JptomewTranslitResult r = jptomew_transliterate("こんにちは世界!")
+    testing.assert_true(r.hiragana == "こんにちはせかい!")
+    testing.assert_true(r.romaji == "konnichiha sekai!")
+}
+
+test jptomew_katakana_and_kana_rules {
+    testing.assert_true(jptomew_hiragana("カタカナ") == "かたかな")
+    testing.assert_true(jptomew_romaji("カタカナ") == "katakana")
+    testing.assert_true(jptomew_romaji("きって がっこう んあ んや") == "kitte gakkou n'a n'ya")
+    testing.assert_true(jptomew_romaji("ばー こーひ") == "baa koohi")
+}
+
+test jptomew_dictionary_and_okurigana {
+    testing.assert_true(jptomew_hiragana("渋谷") == "しぶや")
+    testing.assert_true(jptomew_romaji("渋谷で待ってる") == "shibuya de matteru")
+    testing.assert_true(jptomew_romaji("こんにちは世界!") == "konnichiha sekai!")
+}
+
+test jptomew_detection {
+    testing.assert_true(jptomew_detect("Hello") == JptomewJapaneseCheck.No)
+    testing.assert_true(jptomew_detect("日本") == JptomewJapaneseCheck.Possibly)
+    testing.assert_true(jptomew_detect("ひらがな") == JptomewJapaneseCheck.Yes)
+    testing.assert_true(jptomew_detect("カタカナ") == JptomewJapaneseCheck.Yes)
+    testing.assert_true(!jptomew_is_japanese("ー"))
+}
+
+test jptomew_normalization_repetition_and_aliases {
+    testing.assert_true(jptomew_hiragana("人々") == "人人")
+    testing.assert_true(jptomew_hiragana("人々人") == "人人人")
+    testing.assert_true(jptomew_hiragana("々") == "")
+    testing.assert_true(jptomew_hiragana("藥") == "薬")
+    testing.assert_true(jptomew_hiragana("ＡＢＣ ①") == "ABC 1")
+    testing.assert_true(jptomew_hiragana("！") == "！")
+}
+
+test jptomew_punctuation_spacing_and_fallback {
+    testing.assert_true(jptomew_romaji("Hello 123") == "Hello 123")
+    testing.assert_true(jptomew_romaji("日本。次") == "Nihon. Tsugi")
+    testing.assert_true(jptomew_romaji("「日本」") == "\"Nihon\"")
+    testing.assert_true(jptomew_romaji("⿿") == "⿿")
+    testing.assert_true(jptomew_hiragana("") == "")
+}

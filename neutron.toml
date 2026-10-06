@@ -1,0 +1,19 @@
+[package]
+entry = "main.nt"
+output = "mewsic"
+
+[rust-deps.any_ascii]
+version = "0.1"
+
+[rust-deps.bntomew]
+path = "rust/bntomew"
+
+[rust-deps.jptomew]
+path = "rust/jptomew"
+
+[rust-deps.keyring]
+features = ["sync-secret-service", "vendored"]
+version = "3"
+
+[rust-deps.ureq]
+version = "2"

@@ -1,0 +1,812 @@
+use sys
+use strings
+use arrays
+use json
+use http
+use fmt
+use crypto
+use testing
+use "util.nt"
+use "net.nt"
+use "state.nt"
+use "config.nt"
+use "romanize.nt"
+
+class LyricsSource {
+    var string id
+    var ConfigCustomProvider custom
+    var bool has_custom
+    fun init() {
+        this.id = ""
+        this.custom = ConfigCustomProvider()
+        this.has_custom = false
+    }
+    fun app_name() -> string {
+        if (this.id == "custom") {
+            if (this.has_custom) {
+                if (strings.trim(copy(this.custom.name)) != "") {
+                    return copy(this.custom.name)
+                }
+            }
+            return "Custom"
+        }
+        return config_builtin_provider_label(copy(this.id))
+    }
+}
+
+class LyricsHeaders {
+    var string text
+    fun init() {
+        this.text = "{"
+    }
+    fun add(string name, string value) {
+        if (strings.length(copy(this.text)) > 1) {
+            this.text = this.text + ","
+        }
+        this.text = this.text + json.escape_string(copy(name)) + ":" + json.escape_string(copy(value))
+    }
+    fun to_json() -> string {
+        return this.text + "}"
+    }
+}
+
+fun lyrics_provider_sig(view ConfigLyricsSettings lyrics) -> string {
+    var custom = ""
+    if (lyrics.has_custom) {
+        custom = copy(lyrics.custom.url) + "|" + copy(lyrics.custom.api_key) + "|" + copy(lyrics.custom.json_path)
+    }
+    return strings.join_all(lyrics.providers, ",") + "::" + copy(custom)
+}
+
+class LyricsFetcher {
+    var string config_dir
+    var string cache_dir
+    var string last_fetched_for
+    var string last_provider_sig
+    var bool has_last_romanize
+    var bool last_romanize
+    var RomanizeTable table
+    var bool has_table
+    fun init() {
+        this.config_dir = ""
+        this.cache_dir = ""
+        this.last_fetched_for = ""
+        this.last_provider_sig = ""
+        this.has_last_romanize = false
+        this.last_romanize = false
+        this.table = RomanizeTable()
+        this.has_table = false
+    }
+    fun providers_changed(view ConfigLyricsSettings lyrics) -> bool {
+        return this.last_fetched_for == "" || this.last_provider_sig != lyrics_provider_sig(lyrics)
+    }
+    fun romanize_changed(view ConfigLyricsSettings lyrics) -> bool {
+        return this.has_last_romanize && this.last_romanize != lyrics.romanize
+    }
+}
+
+fun lyrics_options(string headers, int timeout_ms) -> string {
+    var q = util_dquote()
+    var body = q + "headers" + q + ":" + copy(headers)
+    body = body + "," + q + "user_agent" + q + ":" + json.escape_string(net_user_agent())
+    body = body + "," + q + "timeout_ms" + q + ":" + fmt.i64_to_str(timeout_ms)
+    return "{" + body + "}"
+}
+
+fun lyrics_request(string method, string url, string body, string options) -> (int, string) {
+    var resp = http.request_full(copy(method), copy(url), copy(body), copy(options))
+    return (http.status_code(copy(resp)), util_json_first_document(util_json_string(json.get(resp, "body"))))
+}
+
+fun lyrics_json_pointer(view string doc, view string path_text) -> string {
+    var current = copy(doc)
+    var steps = util_lines(strings.replace(copy(path_text), "/", strings.from_char_code(10)))
+    var i = 1
+    while (i < arrays.length(steps)) {
+        var step = copy(steps[i])
+        if (step != "") {
+            if (strings.starts_with(current, "[")) {
+                var items = util_json_array(current)
+                var index = 0
+                if (fmt.is_int(step)) {
+                    index = fmt.to_int(step)
+                }
+                if (index < 0 || index >= arrays.length(items)) {
+                    return "null"
+                }
+                current = copy(items[index])
+            } else {
+                current = json.get(current, step)
+                if (current == "null") {
+                    return "null"
+                }
+            }
+        }
+        i = i + 1
+    }
+    return current
+}
+
+fun lyrics_json_int(string value) -> int {
+    if (fmt.is_int(value)) {
+        return fmt.to_int(copy(value))
+    }
+    var unquoted = util_json_string(copy(value))
+    if (fmt.is_int(copy(unquoted))) {
+        return fmt.to_int(copy(unquoted))
+    }
+    return 0
+}
+
+
+fun lyrics_fetch_lrclib(view string title, view string artist) -> array[StateLyricsLine] {
+    var url = "https://lrclib.net/api/get?track_name=" + util_urlencode(copy(title))
+    url = url + "&artist_name=" + util_urlencode(copy(artist))
+    var (status, body) = lyrics_request("GET", url, "", lyrics_options("{}", 8000))
+    if (status != 200) {
+        throw "LrcLib responded " + fmt.i64_to_str(status)
+    }
+    var synced = util_json_string(json.get(copy(body), "syncedLyrics"))
+    if (strings.trim(synced) == "") {
+        throw "no synced lyrics"
+    }
+    return lyrics_parse_lrc(synced)
+}
+
+fun lyrics_netease_headers() -> string {
+    var headers = LyricsHeaders()
+    headers.add("Referer", "https://music.163.com")
+    headers.add("Cookie", "appver=2.0.2")
+    headers.add("X-Real-IP", "202.96.0.0")
+    return headers.to_json()
+}
+
+fun lyrics_netease_song_id(view string title, view string artist) -> int {
+    var query = copy(title) + "-" + copy(artist)
+    var url = "https://music.163.com/api/search/get?s=" + util_urlencode(query)
+    url = url + "&type=1&offset=0&sub=false&limit=5"
+    var (_, body) = lyrics_request("POST", url, "", lyrics_options(lyrics_netease_headers(), 8000))
+    var payload = json.get(copy(body), "result")
+    if (lyrics_json_int(json.get(payload, "songCount")) == 0) {
+        throw "song not found"
+    }
+    var songs_text = json.get(payload, "songs")
+    if (!util_json_is_array(copy(songs_text))) {
+        throw "no song id in search"
+    }
+    var songs = util_json_array(copy(songs_text))
+    if (arrays.length(songs) == 0) {
+        throw "no song id in search"
+    }
+    var id = lyrics_json_int(json.get(songs[0], "id"))
+    if (id == 0) {
+        throw "no song id in search"
+    }
+    return id
+}
+
+fun lyrics_fetch_netease(view string title, view string artist) -> array[StateLyricsLine] {
+    var id = lyrics_netease_song_id(copy(title), copy(artist))
+    var url = "https://music.163.com/api/song/lyric?tv=-1&kv=-1&lv=-1&os=pc&id=" + fmt.i64_to_str(id)
+    var (_, body) = lyrics_request("POST", url, "", lyrics_options(lyrics_netease_headers(), 8000))
+    var lyric = util_json_string(lyrics_json_pointer(copy(body), "/lrc/lyric"))
+    if (strings.trim(lyric) == "") {
+        throw "no lyric in response"
+    }
+    return lyrics_parse_lrc(lyric)
+}
+
+fun lyrics_qqmusic_headers() -> string {
+    var headers = LyricsHeaders()
+    headers.add("Referer", "http://y.qq.com/portal/player.html")
+    return headers.to_json()
+}
+
+fun lyrics_qqmusic_song_mid(view string title, view string artist) -> string {
+    var query = copy(title) + "-" + copy(artist)
+    var url = "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg?inCharset=utf-8&outCharset=utf-8&format=json&key="
+    url = url + util_urlencode(query)
+    var (_, body) = lyrics_request("GET", url, "", lyrics_options(lyrics_qqmusic_headers(), 8000))
+    if (lyrics_json_int(json.get(copy(body), "count")) == 0) {
+        throw "song not found"
+    }
+    var mid = util_json_string(lyrics_json_pointer(copy(body), "/data/song/itemlist/0/mid"))
+    if (mid == "") {
+        throw "no mid in search"
+    }
+    return mid
+}
+
+fun lyrics_fetch_qqmusic(view string title, view string artist) -> array[StateLyricsLine] {
+    var mid = lyrics_qqmusic_song_mid(copy(title), copy(artist))
+    var url = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?g_tk=5381&format=json&inCharset=utf-8&outCharset=utf-8&songmid="
+    url = url + copy(mid)
+    var (_, body) = lyrics_request("GET", url, "", lyrics_options(lyrics_qqmusic_headers(), 8000))
+    var encoded = util_json_string(json.get(copy(body), "lyric"))
+    if (strings.trim(encoded) == "") {
+        throw "no lyric in response"
+    }
+    var text = util_decode_html_entities(crypto.base64_decode(copy(encoded)))
+    return lyrics_parse_lrc(copy(text))
+}
+
+fun lyrics_custom_request_url(view LyricsSource source, view string title, view string artist) -> string {
+    var key = strings.trim(copy(source.custom.api_key))
+    var url = strings.replace(copy(source.custom.url), "{title}", util_urlencode(copy(title)))
+    url = strings.replace(copy(url), "{artist}", util_urlencode(copy(artist)))
+    return strings.replace(copy(url), "{api_key}", util_urlencode(copy(key)))
+}
+
+fun lyrics_fetch_custom(view LyricsSource source, view string title, view string artist) -> array[StateLyricsLine] {
+    if (strings.trim(copy(source.custom.url)) == "") {
+        throw "custom provider has no url"
+    }
+    var headers = LyricsHeaders()
+    var key = strings.trim(copy(source.custom.api_key))
+    if (key != "") {
+        headers.add("Authorization", "Bearer " + copy(key))
+    }
+    var url = lyrics_custom_request_url(source, copy(title), copy(artist))
+    var (status, body) = lyrics_request("GET", url, "", lyrics_options(headers.to_json(), 8000))
+    if (status != 200) {
+        throw "custom provider responded " + fmt.i64_to_str(status)
+    }
+    var lrc = copy(body)
+    if (strings.trim(copy(source.custom.json_path)) != "") {
+        lrc = util_json_string(lyrics_json_pointer(copy(body), copy(source.custom.json_path)))
+        if (lrc == "") {
+            throw "json path " + copy(source.custom.json_path) + " not found"
+        }
+    }
+    if (strings.trim(copy(lrc)) == "") {
+        throw "custom provider returned no lyrics"
+    }
+    return lyrics_parse_lrc(copy(lrc))
+}
+
+fun lyrics_fetch_source(view LyricsSource source, view string title, view string artist) -> array[StateLyricsLine] {
+    if (source.id == "lrclib") {
+        return lyrics_fetch_lrclib(copy(title), copy(artist))
+    }
+    if (source.id == "netease") {
+        return lyrics_fetch_netease(copy(title), copy(artist))
+    }
+    if (source.id == "qqmusic") {
+        return lyrics_fetch_qqmusic(copy(title), copy(artist))
+    }
+    if (source.id == "custom") {
+        return lyrics_fetch_custom(source, copy(title), copy(artist))
+    }
+    throw "unknown provider " + copy(source.id)
+}
+
+
+fun lyrics_sort_by_time(view array[int] times, view array[string] texts) {
+    var count = arrays.length(times)
+    var i = 1
+    while (i < count) {
+        var time = times[i]
+        var text = copy(texts[i])
+        var j = i
+        while (j > 0 && times[j - 1] > time) {
+            times[j] = times[j - 1]
+            texts[j] = copy(texts[j - 1])
+            j = j - 1
+        }
+        times[j] = time
+        texts[j] = copy(text)
+        i = i + 1
+    }
+}
+
+fun lyrics_parse_lrc(view string text) -> array[StateLyricsLine] {
+    var array[int] times = arrays.fill(0, 0)
+    var array[string] texts = arrays.fill("", 0)
+    var array[int] stamps = arrays.fill(0, 0)
+    var rest = strings.split(copy(text), strings.from_char_code(10))
+    var nl = strings.from_char_code(10)
+    while (!strings.is_empty(rest)) {
+        var at = strings.index_of(rest, nl, 0)
+        var raw = copy(rest)
+        if (at != -1) {
+            raw = strings.substring(rest, 0, at)
+            rest = strings.substring(rest, at + 1, -1)
+        } else {
+            rest = ""
+        }
+        var line = strings.trim(raw)
+        if (line == "") {
+            continue
+        }
+        stamps = arrays.fill(0, 0)
+        var body = lyrics_split_timestamps_into(copy(line), stamps)
+        if (arrays.length(stamps) == 0 || strings.trim(copy(body)) == "") {
+            continue
+        }
+        var k = 0
+        while (k < arrays.length(stamps)) {
+            arrays.push(times, stamps[k])
+            arrays.push(texts, strings.trim(copy(body)))
+            k = k + 1
+        }
+    }
+    lyrics_sort_by_time(times, texts)
+    var array[StateLyricsLine] out = []
+    var i = 0
+    while (i < arrays.length(times)) {
+        var line = StateLyricsLine()
+        line.time = times[i]
+        line.text = copy(texts[i])
+        arrays.push(out, line)
+        i = i + 1
+    }
+    return out
+}
+
+fun lyrics_split_timestamps_into(view string line, view mut array[int] times) -> string {
+    var body = ""
+    var rest = copy(line)
+    var open = strings.index_of(rest, "[", 0)
+    while (open != -1) {
+        body = body + strings.substring(rest, 0, open)
+        var after = strings.substring(rest, open + 1, -1)
+        var end_of_tag = strings.index_of(copy(after), "]", 0)
+        if (end_of_tag != -1) {
+            var tag = strings.substring(copy(after), 0, end_of_tag)
+            var ms = lyrics_parse_time(copy(tag))
+            if (ms >= 0) {
+                arrays.push(times, ms)
+                rest = strings.substring(after, end_of_tag + 1, -1)
+                open = strings.index_of(rest, "[", 0)
+                continue
+            }
+        }
+        body = body + "["
+        rest = copy(after)
+        open = strings.index_of(rest, "[", 0)
+    }
+    return body + copy(rest)
+}
+
+fun lyrics_parse_time(view string tag) -> int {
+    var colon = strings.index_of(copy(tag), ":", 0)
+    if (colon == -1) {
+        return -1
+    }
+    var minutes = strings.trim(strings.substring(tag, 0, colon))
+    var seconds = strings.trim(strings.substring(tag, colon + 1, -1))
+    if (!fmt.is_int(minutes) || !fmt.is_float(seconds)) {
+        return -1
+    }
+    var whole = copy(seconds)
+    var fraction = ""
+    var dot = strings.index_of(copy(seconds), ".", 0)
+    if (dot != -1) {
+        whole = strings.substring(seconds, 0, dot)
+        fraction = strings.substring(seconds, dot + 1, -1)
+    }
+    if (!fmt.is_int(whole)) {
+        return -1
+    }
+    var millis = 0
+    if (fraction != "") {
+        var digits = copy(fraction)
+        if (strings.length(copy(digits)) > 3) {
+            digits = strings.substring(digits, 0, 3)
+        }
+        while (strings.length(copy(digits)) < 3) {
+            digits = copy(digits) + "0"
+        }
+        if (!fmt.is_int(digits)) {
+            return -1
+        }
+        millis = fmt.to_int(digits)
+    }
+    return fmt.to_int(minutes) * 60000 + fmt.to_int(whole) * 1000 + millis
+}
+
+
+fun lyrics_cache_path(view string title, view string artist) -> string {
+    return util_sanitize_filename(copy(title)) + "-" + util_sanitize_filename(copy(artist)) + ".json"
+}
+
+fun lyrics_read_cache(view mut LyricsFetcher fetcher, view string title, view string artist, bool romanize) -> array[StateLyricsLine] {
+    fetcher.last_romanize = romanize
+    fetcher.has_last_romanize = true
+    var path = copy(fetcher.cache_dir) + "/" + lyrics_cache_path(copy(title), copy(artist))
+    var raw = ""
+    quiet [unused_variable] {
+        try {
+            raw = sys.read(copy(path))
+        } catch (e) {
+            raw = ""
+        }
+    }
+    if (raw == "" || !json.is_valid(copy(raw))) {
+        return []
+    }
+    var stored = lyrics_json_pointer(copy(raw), "/lines")
+    if (stored == "null" || stored == "[]") {
+        return []
+    }
+    if (!romanize) {
+        return lyrics_lines_from_json(stored)
+    }
+    var romanized = lyrics_json_pointer(copy(raw), "/romanized")
+    if (romanized == "null" || romanized == "[]") {
+        var from_stored = lyrics_lines_from_json(copy(stored))
+        romanized = lyrics_lines_to_json(lyrics_romanize_lines(fetcher, from_stored))
+        lyrics_store_romanized(fetcher, copy(title), copy(artist), copy(stored), copy(romanized))
+    }
+    return lyrics_lines_from_json(copy(romanized))
+}
+
+fun lyrics_write_cache(view LyricsFetcher fetcher, view string title, view string artist, view string source, view array[StateLyricsLine] lines) {
+    var q = util_dquote()
+    var body = q + "source" + q + ":" + json.escape_string(copy(source))
+    body = body + "," + q + "lines" + q + ":" + lyrics_lines_to_json(lines)
+    body = body + "," + q + "romanized" + q + ":[]"
+    quiet [unused_variable] {
+        try {
+            sys.mkdir(copy(fetcher.cache_dir))
+        } catch (e) {
+        }
+    }
+    quiet [unused_variable] {
+        try {
+            sys.write(copy(fetcher.cache_dir) + "/" + lyrics_cache_path(copy(title), copy(artist)), "{" + body + "}")
+        } catch (e) {
+        }
+    }
+}
+
+fun lyrics_store_romanized(view LyricsFetcher fetcher, view string title, view string artist, view string lines_json, view string romanized_json) {
+    var q = util_dquote()
+    var body = q + "source" + q + ":" + json.escape_string("cache")
+    body = body + "," + q + "lines" + q + ":" + copy(lines_json)
+    body = body + "," + q + "romanized" + q + ":" + copy(romanized_json)
+    quiet [unused_variable] {
+        try {
+            sys.mkdir(copy(fetcher.cache_dir))
+        } catch (e) {
+        }
+    }
+    quiet [unused_variable] {
+        try {
+            sys.write(copy(fetcher.cache_dir) + "/" + lyrics_cache_path(copy(title), copy(artist)), "{" + body + "}")
+        } catch (e) {
+        }
+    }
+}
+
+fun lyrics_lines_to_json(view array[StateLyricsLine] lines) -> string {
+    var q = util_dquote()
+    var parts = "["
+    var i = 0
+    while (i < arrays.length(lines)) {
+        if (i > 0) {
+            parts = parts + ","
+        }
+        var line = lines[i]
+        parts = parts + "{" + q + "time" + q + ":" + fmt.i64_to_str(line.time)
+        parts = parts + "," + q + "text" + q + ":" + json.escape_string(copy(line.text)) + "}"
+        i = i + 1
+    }
+    return parts + "]"
+}
+
+fun lyrics_lines_from_json(string text) -> array[StateLyricsLine] {
+    var array[StateLyricsLine] out = []
+    var items = util_json_array(copy(text))
+    var i = 0
+    while (i < arrays.length(items)) {
+        var line = StateLyricsLine()
+        line.time = lyrics_json_int(json.get(items[i], "time"))
+        line.text = util_json_string(json.get(items[i], "text"))
+        arrays.push(out, line)
+        i = i + 1
+    }
+    return out
+}
+
+
+fun lyrics_fetcher_new(view string config_dir) -> LyricsFetcher {
+    var fetcher = LyricsFetcher()
+    fetcher.config_dir = copy(config_dir)
+    fetcher.cache_dir = copy(config_dir) + "/cache"
+    return fetcher
+}
+
+fun lyrics_table(view mut LyricsFetcher fetcher) -> RomanizeTable {
+    if (fetcher.has_table) {
+        return copy(fetcher.table)
+    }
+    var loaded = romanize_load(copy(fetcher.config_dir))
+    fetcher.table = loaded
+    fetcher.has_table = true
+    return copy(fetcher.table)
+}
+
+fun lyrics_romanize_lines(view mut LyricsFetcher fetcher, view array[StateLyricsLine] lines) -> array[StateLyricsLine] {
+    var table = lyrics_table(fetcher)
+    var array[StateLyricsLine] out = []
+    var i = 0
+    while (i < arrays.length(lines)) {
+        var line = StateLyricsLine()
+        line.time = lines[i].time
+        line.text = romanize_romanize(copy(lines[i].text), table)
+        arrays.push(out, line)
+        i = i + 1
+    }
+    return out
+}
+
+fun lyrics_enabled_sources(view ConfigLyricsSettings lyrics) -> array[LyricsSource] {
+    var array[LyricsSource] out = []
+    var i = 0
+    while (i < arrays.length(lyrics.providers)) {
+        var id = copy(lyrics.providers[i])
+        if (id == "lrclib" || id == "netease" || id == "qqmusic") {
+            var builtin = LyricsSource()
+            builtin.id = copy(id)
+            arrays.push(out, builtin)
+        }
+        if (id == "custom") {
+            if (lyrics.has_custom) {
+                if (strings.trim(copy(lyrics.custom.url)) != "") {
+                    var custom = LyricsSource()
+                    custom.id = "custom"
+                    custom.custom = copy(lyrics.custom)
+                    custom.has_custom = true
+                    arrays.push(out, custom)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fun lyrics_fetch(view mut LyricsFetcher fetcher, view string title, view string artist, view ConfigLyricsSettings lyrics) -> (array[StateLyricsLine], string) {
+    fetcher.last_fetched_for = copy(title) + copy(artist)
+    fetcher.last_provider_sig = lyrics_provider_sig(lyrics)
+
+    var cached = lyrics_read_cache(fetcher, copy(title), copy(artist), lyrics.romanize)
+    if (arrays.length(cached) > 0) {
+        return (cached, "cache")
+    }
+
+    var sources = lyrics_enabled_sources(lyrics)
+    var i = 0
+    while (i < arrays.length(sources)) {
+        var source = copy(sources[i])
+        var lines = lyrics_try_source(copy(source), copy(title), copy(artist))
+        if (arrays.length(lines) > 0) {
+            var name = source.app_name()
+            lyrics_write_cache(fetcher, copy(title), copy(artist), name, lines)
+            fetcher.last_romanize = lyrics.romanize
+            fetcher.has_last_romanize = true
+            if (lyrics.romanize) {
+                var romanized = lyrics_romanize_lines(fetcher, lines)
+                var lines_json = lyrics_lines_to_json(lines)
+                var romanized_json = lyrics_lines_to_json(romanized)
+                lyrics_store_romanized(fetcher, copy(title), copy(artist), lines_json, romanized_json)
+                return (romanized, name)
+            }
+            return (lines, name)
+        }
+        i = i + 1
+    }
+    return ([], "")
+}
+
+fun lyrics_try_source(view LyricsSource source, view string title, view string artist) -> array[StateLyricsLine] {
+    var array[StateLyricsLine] lines = []
+    quiet [unused_variable] {
+        try {
+            lines = lyrics_fetch_source(source, copy(title), copy(artist))
+        } catch (e) {
+            lines = []
+        }
+    }
+    return lines
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+test lyrics_parses_single {
+    var lines = lyrics_parse_lrc("[01:02.50] hello world")
+    testing.assert_true(arrays.length(lines) == 1)
+    testing.assert_true(lines[0].time == 62500)
+    testing.assert_true(lines[0].text == "hello world")
+}
+
+test lyrics_parses_multi_timestamp {
+    var lines = lyrics_parse_lrc("[00:01.00][00:02.00] chorus")
+    testing.assert_true(arrays.length(lines) == 2)
+    testing.assert_true(lines[0].time == 1000)
+    testing.assert_true(lines[1].time == 2000)
+    testing.assert_true(lines[0].text == "chorus")
+}
+
+test lyrics_drops_metadata_and_sorts {
+    var lines = lyrics_parse_lrc("[ti:Some Song]" + strings.from_char_code(10) + "[03:00.00] b" + strings.from_char_code(10) + "[01:00.00] a")
+    testing.assert_true(arrays.length(lines) == 2)
+    testing.assert_true(lines[0].text == "a")
+    testing.assert_true(lines[1].time == 180000)
+}
+
+test lyrics_handles_seconds_only {
+    var lines = lyrics_parse_lrc("[00:05] beep")
+    testing.assert_true(lines[0].time == 5000)
+}
+
+test lyrics_handles_mid_line_timestamps {
+    var lines = lyrics_parse_lrc("text [00:05.00] more")
+    testing.assert_true(arrays.length(lines) == 1)
+    testing.assert_true(lines[0].time == 5000)
+    testing.assert_true(strings.contains(copy(lines[0].text), "text"))
+}
+
+test lyrics_keeps_metadata_as_text {
+    var array[int] times = arrays.fill(0, 0)
+    var body = lyrics_split_timestamps_into("[ti:Some Song] title", times)
+    testing.assert_true(arrays.length(times) == 0)
+    testing.assert_true(strings.contains(body, "[ti:Some Song]"))
+}
+
+test lyrics_parse_time_rejects_non_timestamps {
+    testing.assert_true(lyrics_parse_time("ti:Some Song") == -1)
+    testing.assert_true(lyrics_parse_time("no-colon") == -1)
+    testing.assert_true(lyrics_parse_time("01:xx") == -1)
+    testing.assert_true(lyrics_parse_time("01:02.5") == 62500)
+}
+
+test lyrics_enabled_sources_respect_provider_list {
+    var lyrics = ConfigLyricsSettings()
+    lyrics.providers = ["netease"]
+    testing.assert_true(arrays.length(lyrics_enabled_sources(lyrics)) == 1)
+    lyrics.providers = []
+    testing.assert_true(arrays.length(lyrics_enabled_sources(lyrics)) == 0)
+}
+
+test lyrics_enabled_sources_skips_custom_without_url {
+    var lyrics = ConfigLyricsSettings()
+    lyrics.providers = ["custom"]
+    lyrics.has_custom = true
+    lyrics.custom.name = "My"
+    testing.assert_true(arrays.length(lyrics_enabled_sources(lyrics)) == 0)
+    lyrics.custom.url = "https://example.com/{title}"
+    testing.assert_true(arrays.length(lyrics_enabled_sources(lyrics)) == 1)
+}
+
+test lyrics_providers_changed_detects_provider_edits {
+    var fetcher = lyrics_fetcher_new("/tmp/mewsic-lyrics-none")
+    var lyrics = ConfigLyricsSettings()
+    testing.assert_true(fetcher.providers_changed(lyrics))
+
+    fetcher.last_fetched_for = "songartist"
+    lyrics.providers = ["lrclib", "netease"]
+    fetcher.last_provider_sig = lyrics_provider_sig(lyrics)
+    testing.assert_true(!fetcher.providers_changed(lyrics))
+
+    lyrics.providers = ["netease"]
+    testing.assert_true(fetcher.providers_changed(lyrics))
+
+    lyrics.providers = ["custom"]
+    lyrics.has_custom = true
+    lyrics.custom.url = "https://example.com/{title}"
+    lyrics.custom.api_key = "k"
+    fetcher.last_provider_sig = lyrics_provider_sig(lyrics)
+    testing.assert_true(!fetcher.providers_changed(lyrics))
+
+    lyrics.custom.api_key = "k2"
+    testing.assert_true(fetcher.providers_changed(lyrics))
+}
+
+test lyrics_custom_source_substitutes_all_placeholders {
+    var source = LyricsSource()
+    source.id = "custom"
+    source.has_custom = true
+    source.custom.url = "https://example.com/q?t={title}&a={artist}&k={api_key}"
+    source.custom.api_key = "top secret"
+    var url = lyrics_custom_request_url(source, "Hello World", "AC/DC")
+    testing.assert_true(strings.contains(url, "t=Hello%20World"))
+    testing.assert_true(strings.contains(url, "a=AC%2FDC"))
+    testing.assert_true(strings.contains(url, "k=top%20secret"))
+
+    source.custom.api_key = ""
+    testing.assert_true(strings.ends_with(lyrics_custom_request_url(source, "s", "a"), "k="))
+}
+
+test lyrics_source_app_name {
+    var source = LyricsSource()
+    source.id = "lrclib"
+    testing.assert_true(source.app_name() == "LrcLib")
+    source.id = "custom"
+    source.has_custom = true
+    source.custom.name = ""
+    testing.assert_true(source.app_name() == "Custom")
+    source.custom.name = "My Provider"
+    testing.assert_true(source.app_name() == "My Provider")
+}
+
+test lyrics_json_pointer_resolves_paths {
+    var q = util_dquote()
+    var doc = "{" + q + "lrc" + q + ":{" + q + "lyric" + q + ":" + q + "[00:01.00] hi" + q + "}"
+    doc = doc + "," + q + "songs" + q + ":[" + "{" + q + "id" + q + ":42}]}"
+    testing.assert_true(util_json_string(lyrics_json_pointer(doc, "/lrc/lyric")) == "[00:01.00] hi")
+    testing.assert_true(lyrics_json_int(lyrics_json_pointer(doc, "/songs/0/id")) == 42)
+    testing.assert_true(lyrics_json_pointer(doc, "/lrc/missing") == "null")
+}
+
+test lyrics_cache_round_trip_keeps_source_and_lines {
+    var dir = "/tmp/mewsic-lyrics-cache-test"
+    var fetcher = lyrics_fetcher_new(copy(dir))
+    var lines = lyrics_parse_lrc("[00:01.00] hello" + strings.from_char_code(10) + "[00:02.00] world")
+    lyrics_write_cache(fetcher, "Song", "Artist", "test", lines)
+    var read = lyrics_read_cache(fetcher, "Song", "Artist", false)
+    testing.assert_true(arrays.length(read) == 2)
+    testing.assert_true(read[0].text == "hello")
+    testing.assert_true(read[1].time == 2000)
+
+    var q = util_dquote()
+    var raw = sys.read(dir + "/cache/Song-Artist.json")
+    testing.assert_true(strings.contains(copy(raw), q + "source" + q + ":" + json.escape_string("test")))
+    var back = lyrics_lines_from_json(lyrics_json_pointer(copy(raw), "/lines"))
+    testing.assert_true(arrays.length(back) == 2)
+    testing.assert_true(back[0].text == "hello")
+    testing.assert_true(back[1].time == 2000)
+    sys.rm(dir + "/cache/Song-Artist.json")
+}
+
+test lyrics_romanize_setting_change_forces_cache_reload {
+    var dir = "/tmp/mewsic-lyrics-cache-toggle"
+    var fetcher = lyrics_fetcher_new(dir)
+    var lines = lyrics_parse_lrc("[00:01.00] さくら")
+    lyrics_write_cache(fetcher, "Song2", "Artist", "test", lines)
+    var settings = ConfigLyricsSettings()
+    var read = lyrics_read_cache(fetcher, "Song2", "Artist", false)
+    testing.assert_true(arrays.length(read) == 1)
+    testing.assert_true(read[0].text == "さくら")
+    testing.assert_true(!fetcher.romanize_changed(settings))
+    settings.romanize = true
+    testing.assert_true(fetcher.romanize_changed(settings))
+    sys.rm(dir + "/cache/Song2-Artist.json")
+}
+
+test lyrics_cache_lookup_reads_stored_lines {
+    var fetcher = lyrics_fetcher_new("/home/yasakei/.config/mewsic")
+    var lines = lyrics_read_cache(fetcher, "Something About You", "Eyedress", false)
+    testing.assert_true(arrays.length(lines) > 0)
+}
+
+test probe_whatyouknow_cache {
+    var fetcher = lyrics_fetcher_new("/home/yasakei/.config/mewsic")
+    var lines = lyrics_read_cache(fetcher, "What You Know", "Two Door Cinema Club", false)
+    say("wyk-lines=" + fmt.i64_to_str(arrays.length(lines)))
+    testing.assert_true(true)
+}
+
+test probe_loretta_cache {
+    var fetcher = lyrics_fetcher_new("/home/yasakei/.config/mewsic")
+    var lines = lyrics_read_cache(fetcher, "Loretta", "Ginger Root", false)
+    say("loretta-lines=" + fmt.i64_to_str(arrays.length(lines)))
+    testing.assert_true(arrays.length(lines) > 0)
+}

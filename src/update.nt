@@ -1,0 +1,383 @@
+use os
+use sys
+use strings
+use arrays
+use crypto
+use fmt
+use json
+use http
+use crypto
+use "log.nt"
+use "util.nt"
+use "state.nt"
+use "net.nt"
+use process
+use testing
+
+static const var string update_latest_api = "https://mewsic.yasakei.dev/v1/release/latest"
+static const var string update_checksum_asset = "checksums.txt"
+static const var string update_windows_installer = "mewsic-setup.exe"
+static const var int update_timeout_ms = 15000
+
+fun update_asset_name() -> string {
+    var system = update_os()
+    var machine = update_arch()
+    if (system == "windows" || system == "mingw" || system == "cygwin") {
+        if (machine == "x86_64" || machine == "amd64") {
+            return "mewsic-x86_64-pc-windows-msvc.exe"
+        }
+        return ""
+    }
+    if (system == "darwin" || system == "macos") {
+        if (machine == "arm64" || machine == "aarch64") {
+            return "mewsic-aarch64-apple-darwin"
+        }
+        return "mewsic-x86_64-apple-darwin"
+    }
+    if (system == "linux") {
+        if (machine == "aarch64" || machine == "arm64") {
+            return "mewsic-aarch64-unknown-linux-gnu"
+        }
+        return "mewsic-x86_64-unknown-linux-gnu"
+    }
+    return ""
+}
+
+fun update_strip_leading_v(view string version) -> string {
+    if (strings.starts_with(copy(version), "v") || strings.starts_with(copy(version), "V")) {
+        return strings.substring(copy(version), 1, -1)
+    }
+    return copy(version)
+}
+
+fun update_os() -> string {
+    if (os.getenv("OS") == "Windows_NT") {
+        return "windows"
+    }
+    var uname = ""
+    quiet [unused_variable] {
+        try {
+            uname = process.exec_output("uname -s")
+        } catch (e) {
+            return "linux"
+        }
+    }
+    var system = strings.lower(strings.trim(copy(uname)))
+    if (strings.contains(copy(system), "darwin")) {
+        return "darwin"
+    }
+    return "linux"
+}
+
+fun update_arch() -> string {
+    var machine = ""
+    quiet [unused_variable] {
+        try {
+            machine = process.exec_output("uname -m")
+        } catch (e) {
+            return "x86_64"
+        }
+    }
+    machine = strings.lower(strings.trim(copy(machine)))
+    if (machine == "aarch64" || machine == "arm64") {
+        return "aarch64"
+    }
+    return "x86_64"
+}
+
+fun update_version_parts(view string version) -> array[int] {
+    var array[int] parts = arrays.fill(0, 0)
+    var clean = copy(update_strip_leading_v(version))
+    for (var piece in util_split_all(copy(clean), ".")) {
+        var int value = 0
+        var digits = ""
+        for (var i = 0; i < strings.length(copy(piece)); i = i + 1) {
+            var ch = strings.char_at(copy(piece), i)
+            if (!strings.is_digit(ch)) {
+                break
+            }
+            digits = digits + ch
+        }
+        if (digits != "") {
+            value = fmt.to_int(copy(digits))
+        }
+        arrays.push(parts, value)
+    }
+    return parts
+}
+
+fun update_is_newer(view string next, view string current) -> bool {
+    var a = update_version_parts(copy(next))
+    var b = update_version_parts(copy(current))
+    var int len = arrays.length(a)
+    if (arrays.length(b) > len) {
+        len = arrays.length(b)
+    }
+    for (var i = 0; i < len; i = i + 1) {
+        var int left = 0
+        if (i < arrays.length(a)) {
+            left = a[i]
+        }
+        var int right = 0
+        if (i < arrays.length(b)) {
+            right = b[i]
+        }
+        if (left != right) {
+            return left > right
+        }
+    }
+    return false
+}
+
+fun update_options() -> string {
+    var q = util_dquote()
+    var body = q + "user_agent" + q + ":" + json.escape_string("mewsic-updater/" + copy(mewsic_version))
+    body = body + "," + q + "timeout_ms" + q + ":" + fmt.i64_to_str(update_timeout_ms)
+    return "{" + body + "}"
+}
+
+fun update_request(string url) -> (int, string) {
+    var resp = http.request_full("GET", copy(url), "", update_options())
+    return (http.status_code(copy(resp)), util_json_first_document(util_json_string(json.get(resp, "body"))))
+}
+
+fun update_latest_release() -> (bool, string, string, string, string) {
+    var (status, body) = update_request(copy(update_latest_api))
+    if (status != 200) {
+        return (false, "", "", "", "release API returned " + fmt.i64_to_str(status))
+    }
+    var release = json.get(copy(body), "release")
+    if (release == "" || release == "null") {
+        release = json.get(copy(body), "data")
+    }
+    var tag = util_json_string(json.get(copy(release), "tag_name"))
+    if (tag == "" || tag == "null") {
+        tag = util_json_string(json.get(copy(release), "tag"))
+    }
+    if (tag == "" || tag == "null") {
+        return (false, "", "", "", "release API returned no tag")
+    }
+    var version = tag
+    version = update_strip_leading_v(copy(version))
+    var asset = update_asset_name()
+    if (asset == "") {
+        return (false, copy(version), "", "", "")
+    }
+    var asset_url = ""
+    var checksums_url = ""
+    var assets = json.get(copy(release), "assets")
+    var int count = json.length(copy(assets))
+    for (var i = 0; i < count; i = i + 1) {
+        var entry = json.at(copy(assets), i)
+        var name = util_json_string(json.get(copy(entry), "name"))
+        if (name == copy(update_checksum_asset) && checksums_url == "") {
+            checksums_url = util_json_string(json.get(copy(entry), "browser_download_url"))
+            if (checksums_url == "" || checksums_url == "null") {
+                checksums_url = util_json_string(json.get(copy(entry), "url"))
+            }
+            continue
+        }
+        if (name == copy(asset) && asset_url == "") {
+            asset_url = util_json_string(json.get(copy(entry), "browser_download_url"))
+            if (asset_url == "" || asset_url == "null") {
+                asset_url = util_json_string(json.get(copy(entry), "url"))
+            }
+        }
+    }
+    if (asset_url == "") {
+        return (false, copy(version), "", copy(checksums_url), "")
+    }
+    return (true, copy(version), copy(asset_url), copy(checksums_url), "")
+}
+
+fun update_expected_sha256(view string checksums, view string asset) -> string {
+    for (var line in util_lines(copy(checksums))) {
+        var trimmed = strings.trim(copy(line))
+        if (trimmed == "" || strings.starts_with(copy(trimmed), "#")) {
+            continue
+        }
+        var hash = ""
+        var name = ""
+        for (var field in util_split_all(copy(trimmed), " ")) {
+            if (field == "") {
+                continue
+            }
+            if (hash == "") {
+                hash = copy(field)
+                continue
+            }
+            name = copy(field)
+        }
+        if (hash == "" || name == "") {
+            continue
+        }
+        if (strings.starts_with(copy(name), "*")) {
+            name = strings.substring(copy(name), 1, -1)
+        }
+        if (os.path_basename(copy(name)) == copy(asset)) {
+            return copy(hash)
+        }
+    }
+    return ""
+}
+
+fun update_dir(view StateAppContext ctx) -> string {
+    return copy(ctx.config_dir) + "/update"
+}
+
+fun update_download_and_verify(view StateAppContext ctx, string url, string checksums_url, string asset, string version) -> (bool, string, string) {
+    var expected = ""
+    if (checksums_url != "") {
+        var (cstatus, checksums) = update_request(copy(checksums_url))
+        if (cstatus == 200) {
+            expected = update_expected_sha256(copy(checksums), copy(asset))
+        }
+    }
+    var (status, body) = update_request(copy(url))
+    if (status != 200) {
+        return (false, "", "download returned " + fmt.i64_to_str(status))
+    }
+    if (expected != "" && !crypto.verify_sha256(copy(body), copy(expected))) {
+        return (false, "", "checksum mismatch for " + copy(asset))
+    }
+    var dir = update_dir(ctx)
+    quiet [unused_variable] {
+        try {
+            sys.mkdir(copy(dir))
+        } catch (e) {
+        }
+    }
+    var staged = dir + "/" + copy(asset) + "." + copy(version)
+    quiet [unused_variable] {
+        try {
+            sys.write(copy(staged), copy(body))
+        } catch (e) {
+        }
+    }
+    if (!sys.exists(copy(staged))) {
+        return (false, "", "could not stage the update")
+    }
+    return (true, copy(staged), "")
+}
+
+fun update_install_in_place(string exe, string staged) -> (bool, string) {
+    var old = copy(exe) + ".old"
+    quiet [unused_variable] {
+        try {
+            if (sys.exists(copy(old))) {
+                sys.rm(copy(old))
+            }
+        } catch (e) {
+        }
+    }
+    if (os.rename(copy(exe), copy(old))) {
+        if (sys.cp(copy(staged), copy(exe))) {
+            quiet [unused_variable] {
+                try {
+                    sys.rm(copy(old))
+                } catch (e) {
+                }
+            }
+            return (true, "")
+        }
+        os.rename(copy(old), copy(exe))
+        return (false, "could not copy the new binary into place")
+    }
+    if (sys.cp(copy(staged), copy(exe))) {
+        return (true, "")
+    }
+    return (false, "could not replace " + copy(exe))
+}
+
+fun update_check_only(view mut StateAppContext ctx) -> string {
+    var current = copy(mewsic_version)
+    if (update_asset_name() == "") {
+        return update_record(ctx, "", "auto-update is not available on " + update_os() + "/" + update_arch())
+    }
+    var (ok, version, url, digests, err) = update_latest_release()
+    quiet [unused_variable] {
+        digests = digests
+    }
+    if (err != "") {
+        return update_record(ctx, "", "update check failed: " + copy(err))
+    }
+    if (!ok) {
+        if (url == "") {
+            return update_record(ctx, "", "no release asset for this platform")
+        }
+        return update_record(ctx, "", "no releases found")
+    }
+    if (!update_is_newer(copy(version), copy(current))) {
+        return update_record(ctx, "", "up to date (v" + copy(current) + ")")
+    }
+    return update_record(ctx, copy(version), "v" + copy(version) + " is available (you're on v" + copy(current) + ") — run `mewsic update` to install")
+}
+
+fun update_run(view mut StateAppContext ctx) -> string {
+    var current = copy(mewsic_version)
+    var asset = update_asset_name()
+    if (asset == "") {
+        return update_record(ctx, "", "auto-update is not available on " + update_os() + "/" + update_arch())
+    }
+    var (ok, version, url, checksums_url, err) = update_latest_release()
+    if (err != "") {
+        return update_record(ctx, "", "update check failed: " + copy(err))
+    }
+    if (!ok) {
+        return update_record(ctx, "", "no release asset for this platform")
+    }
+    if (!update_is_newer(copy(version), copy(current))) {
+        return update_record(ctx, "", "up to date (v" + copy(current) + ")")
+    }
+    var (dok, staged, derr) = update_download_and_verify(ctx, copy(url), copy(checksums_url), copy(asset), copy(version))
+    if (!dok) {
+        return update_record(ctx, copy(version), "v" + copy(version) + " available but the install failed: " + copy(derr))
+    }
+    if (update_os() == "windows") {
+        var (iok2, staged2, err2) = update_download_and_verify(ctx, copy(url), copy(checksums_url), copy(update_windows_installer), copy(version))
+        if (iok2) {
+            return update_record(ctx, copy(version), "v" + copy(version) + " downloaded to " + copy(staged2) + " — run it to finish the install")
+        }
+        return update_record(ctx, copy(version), "v" + copy(version) + " available but the installer download failed: " + copy(err2))
+    }
+    var exe = os.executable_path()
+    if (exe == "") {
+        return update_record(ctx, copy(version), "v" + copy(version) + " downloaded to " + copy(staged) + ", but the running binary could not be located")
+    }
+    var (iok, ierr) = update_install_in_place(copy(exe), copy(staged))
+    if (!iok) {
+        return update_record(ctx, copy(version), "v" + copy(version) + " downloaded to " + copy(staged) + ", but " + copy(ierr))
+    }
+    return update_record(ctx, copy(version), "v" + copy(version) + " installed — restart mewsic to use it")
+}
+
+fun update_record(view mut StateAppContext ctx, string latest, string message) -> string {
+    ctx.state.update.latest = copy(latest)
+    ctx.state.update.message = copy(message)
+    log_write(copy(ctx.config_dir), "update: " + copy(message))
+    return copy(message)
+}
+
+test update_version_comparison {
+    testing.assert_true(update_is_newer("1.2.3", "1.2.2"))
+    testing.assert_true(update_is_newer("v1.3.0", "1.2.9"))
+    testing.assert_true(update_is_newer("2.0.0", "1.99.99"))
+    testing.assert_true(!update_is_newer("1.2.3", "1.2.3"))
+    testing.assert_true(!update_is_newer("1.2.2", "1.2.3"))
+    testing.assert_true(!update_is_newer("1.2", "1.2.0"))
+}
+
+test update_version_parts_ignore_junk {
+    var parts = update_version_parts("v1.2.3")
+    testing.assert_true(arrays.length(parts) == 3)
+    testing.assert_true(parts[0] == 1)
+    testing.assert_true(parts[2] == 3)
+    testing.assert_true(arrays.length(update_version_parts("1")) == 1)
+}
+
+test update_checksum_lookup {
+    var list = "abc123  mewsic-x86_64-unknown-linux-gnu" + strings.from_char_code(10) + "def456  other-file"
+    testing.assert_true(update_expected_sha256(copy(list), "mewsic-x86_64-unknown-linux-gnu") == "abc123")
+    testing.assert_true(update_expected_sha256(copy(list), "other-file") == "def456")
+    testing.assert_true(update_expected_sha256(copy(list), "missing") == "")
+}

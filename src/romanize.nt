@@ -1,0 +1,1110 @@
+use sys
+use os
+use strings
+use json
+use toml
+use fmt
+use arrays
+use testing
+use @any_ascii
+use @bntomew
+use @jptomew
+use sys
+use toml
+use "log.nt"
+use "util.nt"
+
+static const var int dialect_plain = 0
+static const var int dialect_hindi = 1
+static const var int dialect_bengali = 2
+static const var int dialect_punjabi = 3
+
+static const var int map_conjunct = 0
+static const var int map_consonant = 1
+static const var int map_vowel = 2
+static const var int map_matra = 3
+static const var int map_nukta = 4
+static const var int map_conjunct_letter = 5
+
+class RomanizeTable {
+    var array[string] chart_names
+    var array[int] chart_caps
+    var array[int] letter_chart
+    var array[string] letter_key
+    var array[string] letter_val
+    var array[string] ab_names
+    var array[int] ab_dialect
+    var array[int] ab_start
+    var array[int] ab_end
+    var array[string] ab_punct
+    var array[string] ab_halant
+    var array[string] ab_anusvara
+    var array[string] ab_candra
+    var array[string] ab_visarga
+    var array[string] ab_nukta
+    var array[string] ab_gemination
+    var array[string] ab_inherent
+    var array[string] ab_labials
+    var array[string] ab_digits
+    var array[int] map_ab
+    var array[int] map_kind
+    var array[string] map_key
+    var array[string] map_val
+    var array[string] word_keys
+    var array[string] word_vals
+    fun init() {
+        this.chart_names = arrays.fill("", 0)
+        this.chart_caps = arrays.fill(0, 0)
+        this.letter_chart = arrays.fill(0, 0)
+        this.letter_key = arrays.fill("", 0)
+        this.letter_val = arrays.fill("", 0)
+        this.ab_names = arrays.fill("", 0)
+        this.ab_dialect = arrays.fill(0, 0)
+        this.ab_start = arrays.fill(0, 0)
+        this.ab_end = arrays.fill(0, 0)
+        this.ab_punct = arrays.fill("", 0)
+        this.ab_halant = arrays.fill("", 0)
+        this.ab_anusvara = arrays.fill("", 0)
+        this.ab_candra = arrays.fill("", 0)
+        this.ab_visarga = arrays.fill("", 0)
+        this.ab_nukta = arrays.fill("", 0)
+        this.ab_gemination = arrays.fill("", 0)
+        this.ab_inherent = arrays.fill("", 0)
+        this.ab_labials = arrays.fill("", 0)
+        this.ab_digits = arrays.fill("", 0)
+        this.map_ab = arrays.fill(0, 0)
+        this.map_kind = arrays.fill(0, 0)
+        this.map_key = arrays.fill("", 0)
+        this.map_val = arrays.fill("", 0)
+        this.word_keys = arrays.fill("", 0)
+        this.word_vals = arrays.fill("", 0)
+    }
+    fun chart_count() -> int {
+        return arrays.length(this.chart_names)
+    }
+    fun abugida_count() -> int {
+        return arrays.length(this.ab_names)
+    }
+}
+
+fun romanize_is_upper(view string ch) -> bool {
+    var up = strings.upper(ch)
+    var lo = strings.lower(ch)
+    return up != lo && ch == up
+}
+
+fun romanize_chart_index(view RomanizeTable t, view string name) -> int {
+    var i = 0
+    while (i < arrays.length(t.chart_names)) {
+        if (t.chart_names[i] == name) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fun romanize_ab_index(view RomanizeTable t, view string name) -> int {
+    var i = 0
+    while (i < arrays.length(t.ab_names)) {
+        if (t.ab_names[i] == name) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fun romanize_chart_map(view RomanizeTable t, view string ch) -> string {
+    var c = 0
+    while (c < arrays.length(t.chart_names)) {
+        var e = 0
+        while (e < arrays.length(t.letter_key)) {
+            if (t.letter_chart[e] == c && t.letter_key[e] == ch) {
+                return copy(t.letter_val[e])
+            }
+            e = e + 1
+        }
+        if (t.chart_caps[c] == 1 && romanize_is_upper(ch)) {
+            var low = util_first_char(strings.lower(ch))
+            var f = 0
+            while (f < arrays.length(t.letter_key)) {
+                if (t.letter_chart[f] == c && t.letter_key[f] == low) {
+                    return util_capitalize_first(copy(t.letter_val[f]))
+                }
+                f = f + 1
+            }
+        }
+        c = c + 1
+    }
+    return ""
+}
+
+fun romanize_abugida_for(view RomanizeTable t, int code, view string ch) -> int {
+    var i = 0
+    while (i < arrays.length(t.ab_names)) {
+        if (code >= t.ab_start[i] && code <= t.ab_end[i] && !strings.contains(t.ab_punct[i], ch)) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fun romanize_map_get(view RomanizeTable t, int ab, int kind, view string key) -> (bool, string) {
+    var i = 0
+    while (i < arrays.length(t.map_key)) {
+        if (t.map_ab[i] == ab && t.map_kind[i] == kind && t.map_key[i] == key) {
+            return (true, copy(t.map_val[i]))
+        }
+        i = i + 1
+    }
+    return (false, "")
+}
+
+fun romanize_word_at(view RomanizeTable t, view array[string] chars, int i) -> (bool, string, string) {
+    if (arrays.length(t.word_keys) == 0) {
+        return (false, "", "")
+    }
+    var tail = ""
+    var k = i
+    while (k < arrays.length(chars) && k < i + 12) {
+        tail = tail + chars[k]
+        k = k + 1
+    }
+    var w = 0
+    while (w < arrays.length(t.word_keys)) {
+        if (strings.starts_with(tail, t.word_keys[w])) {
+            return (true, copy(t.word_keys[w]), copy(t.word_vals[w]))
+        }
+        w = w + 1
+    }
+    return (false, "", "")
+}
+
+fun romanize_chars_of(view string s) -> array[string] {
+    var array[string] out = arrays.fill("", 0)
+    var rest = strings.split(s, "")
+    var nl = strings.from_char_code(10)
+    while (!strings.is_empty(rest)) {
+        var at = strings.index_of(rest, nl, 0)
+        if (at == -1) {
+            arrays.push(out, rest)
+            rest = ""
+        } else {
+            arrays.push(out, strings.substring(rest, 0, at))
+            rest = strings.substring(rest, at + 1, -1)
+        }
+    }
+    return out
+}
+
+fun romanize_is_kana(int code) -> bool {
+    return (code >= 12353 && code <= 12438) || (code >= 12445 && code <= 12447) || (code >= 12449 && code <= 12542)
+}
+
+fun romanize_is_cjk(int code) -> bool {
+    return (code >= 19968 && code <= 40959) || (code >= 13312 && code <= 19893)
+}
+
+fun romanize_is_japanese(int code, view string ch) -> bool {
+    if (romanize_is_kana(code) || romanize_is_cjk(code)) {
+        return true
+    }
+    return ch == "々" || ch == "〆" || ch == "〇"
+}
+
+fun romanize_is_bengali(int code) -> bool {
+    return code >= 2432 && code <= 2559
+}
+
+fun romanize_is_arabic(int code) -> bool {
+    return (code >= 1536 && code <= 1791) || (code >= 1872 && code <= 1919) || (code >= 2216 && code <= 2303) || (code >= 64336 && code <= 65023) || (code >= 65136 && code <= 65279)
+}
+
+fun romanize_is_hangul(int code) -> bool {
+    return (code >= 44032 && code <= 55203) || (code >= 4352 && code <= 4607) || (code >= 12592 && code <= 12687) || (code >= 43360 && code <= 43391) || (code >= 55216 && code <= 55295)
+}
+
+fun romanize_romanize(view string text, view RomanizeTable table) -> string {
+    var chars = romanize_chars_of(text)
+    var n = arrays.length(chars)
+    var has_kana = false
+    var s = 0
+    while (s < n) {
+        if (romanize_is_kana(util_codepoint(chars[s]))) {
+            has_kana = true
+        }
+        s = s + 1
+    }
+    var out = ""
+    var i = 0
+    while (i < n) {
+        var ch = copy(chars[i])
+        var code = util_codepoint(ch)
+        if (code == 8204 || code == 8205) {
+            i = i + 1
+            continue
+        }
+        if (romanize_is_cjk(code)) {
+            var (found, word, romaji) = romanize_word_at(table, chars, i)
+            if (found) {
+                out = out + romaji
+                i = i + util_char_count(word)
+                continue
+            }
+        }
+        if (has_kana && romanize_is_japanese(code, ch)) {
+            var start = i
+            while (i < n && romanize_is_japanese(util_codepoint(chars[i]), chars[i])) {
+                i = i + 1
+            }
+            var segment = ""
+            var k = start
+            while (k < i) {
+                segment = segment + chars[k]
+                k = k + 1
+            }
+            out = out + @jptomew.TranslitResult_romaji(@jptomew.transliterate(segment))
+            continue
+        }
+        if (romanize_is_bengali(code)) {
+            var start = i
+            while (i < n && romanize_is_bengali(util_codepoint(chars[i]))) {
+                i = i + 1
+            }
+            var segment = ""
+            var k = start
+            while (k < i) {
+                segment = segment + chars[k]
+                k = k + 1
+            }
+            out = out + @bntomew.TranslitResult_romanized(@bntomew.transliterate(segment))
+            continue
+        }
+        if (romanize_is_arabic(code)) {
+            var start = i
+            while (i < n && romanize_is_arabic(util_codepoint(chars[i]))) {
+                i = i + 1
+            }
+            var segment = ""
+            var k = start
+            while (k < i) {
+                segment = segment + chars[k]
+                k = k + 1
+            }
+            out = out + @any_ascii.any_ascii(segment)
+            continue
+        }
+        var ab = romanize_abugida_for(table, code, ch)
+        if (ab != -1) {
+            var start = i
+            while (i < n && romanize_ab_word_char(table, ab, chars[i])) {
+                i = i + 1
+            }
+            out = out + romanize_indic(table, chars, start, i, ab)
+            continue
+        }
+        if (romanize_is_hangul(code)) {
+            var start = i
+            while (i < n && romanize_is_hangul(util_codepoint(chars[i]))) {
+                i = i + 1
+            }
+            var segment = ""
+            var k = start
+            while (k < i) {
+                segment = segment + chars[k]
+                k = k + 1
+            }
+            out = out + strings.lower(@any_ascii.any_ascii(segment))
+            continue
+        }
+        var mapped = romanize_chart_map(table, ch)
+        if (mapped != "") {
+            out = out + mapped
+        } else {
+            out = out + ch
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fun romanize_ab_word_char(view RomanizeTable t, int ab, view string ch) -> bool {
+    var code = util_codepoint(copy(ch))
+    return code >= t.ab_start[ab] && code <= t.ab_end[ab] && !strings.contains(t.ab_punct[ab], ch)
+}
+
+fun romanize_data_dir() -> string {
+    var exe = util_argv0()
+    var slash = strings.last_index_of(exe, "/")
+    var exe_dir = "."
+    if (slash != -1) {
+        exe_dir = strings.substring(exe, 0, slash)
+    }
+    if (sys.exists(exe_dir + "/romanize/cyrillic.toml")) {
+        return exe_dir + "/romanize"
+    }
+    if (sys.exists("data/romanize/cyrillic.toml")) {
+        return "data/romanize"
+    }
+    return ""
+}
+
+fun romanize_load(view string dir) -> RomanizeTable {
+    var t = RomanizeTable()
+    var data = romanize_data_dir()
+    if (data == "") {
+        throw "romanize data not found (looked in exe dir and ./data/romanize)"
+    }
+    romanize_load_file(t, data + "/cyrillic.toml", dir)
+    romanize_load_file(t, data + "/greek.toml", dir)
+    romanize_load_file(t, data + "/japanese.toml", dir)
+    romanize_load_file(t, data + "/devanagari.toml", dir)
+    romanize_load_file(t, data + "/punjabi.toml", dir)
+    romanize_sort_words(t)
+    var overlay = copy(dir) + "/romanize"
+    var entries = ""
+    quiet [unused_variable] {
+        try {
+            entries = sys.listdir(overlay)
+        } catch (e) {
+            return t
+        }
+    }
+    var rest = entries
+    var nl = strings.from_char_code(10)
+    while (!strings.is_empty(rest)) {
+        var at = strings.index_of(rest, nl, 0)
+        var name = copy(rest)
+        if (at != -1) {
+            name = strings.substring(rest, 0, at)
+            rest = strings.substring(rest, at + 1, -1)
+        } else {
+            rest = ""
+        }
+        name = strings.trim(name)
+        if (name == "" || !strings.ends_with(name, ".toml")) {
+            continue
+        }
+        if (strings.substring(name, 0, strings.length(name) - 5) == "template") {
+            continue
+        }
+        var path = overlay + "/" + name
+        var raw = ""
+        quiet [unused_variable] {
+            try {
+                raw = sys.read(path)
+            } catch (e) {
+                continue
+            }
+        }
+        var parsed = ""
+        try {
+            parsed = toml.parse(raw)
+        } catch (e) {
+            log_write(dir, "ignoring " + path + ": " + e)
+            continue
+        }
+        var scripts = json.get(parsed, "scripts")
+        if (scripts == "null") {
+            continue
+        }
+        romanize_parse_script(t, scripts, dir)
+    }
+    romanize_sort_words(t)
+    return t
+}
+
+fun romanize_load_file(view mut RomanizeTable t, view string path, view string log_dir) {
+    var raw = sys.read(path)
+    var parsed = toml.parse(raw)
+    var scripts = json.get(parsed, "scripts")
+    romanize_parse_script(t, scripts, log_dir)
+}
+
+fun romanize_parse_script(view mut RomanizeTable t, view string obj, view string log_dir) {
+    var kind = util_json_string(json.get(obj, "kind"))
+    if (kind == "chart") {
+        romanize_parse_chart(t, obj)
+        return
+    }
+    if (kind == "words") {
+        romanize_parse_words(t, obj)
+        return
+    }
+    if (kind == "abugida") {
+        romanize_parse_abugida(t, obj)
+        return
+    }
+    throw "unknown script kind: " + kind
+}
+
+fun romanize_parse_chart(view mut RomanizeTable t, view string obj) {
+    var name = util_json_string(json.get(obj, "name"))
+    if (name == "") {
+        throw "chart without a name"
+    }
+    var cap = false
+    if (json.get(obj, "capitalize_first") == "true") {
+        cap = true
+    }
+    var idx = romanize_chart_index(t, name)
+    if (idx == -1) {
+        arrays.push(t.chart_names, name)
+        if (cap) {
+            arrays.push(t.chart_caps, 1)
+        } else {
+            arrays.push(t.chart_caps, 0)
+        }
+        idx = arrays.length(t.chart_names) - 1
+    } else {
+        if (cap) {
+            t.chart_caps[idx] = 1
+        }
+    }
+    var letters = json.get(obj, "letters")
+    if (letters == "null") {
+        return
+    }
+    var keys = strings.split(json.keys(letters), ",")
+    var rest = keys
+    var nl = strings.from_char_code(10)
+    while (!strings.is_empty(rest)) {
+        var at = strings.index_of(rest, nl, 0)
+        var key = copy(rest)
+        if (at != -1) {
+            key = strings.substring(rest, 0, at)
+            rest = strings.substring(rest, at + 1, -1)
+        } else {
+            rest = ""
+        }
+        key = strings.trim(key)
+        if (key == "") {
+            continue
+        }
+        var v = json.get(letters, key)
+        if (v == "null") {
+            continue
+        }
+        var val = util_json_string(v)
+        var e = 0
+        var done = false
+        while (e < arrays.length(t.letter_key)) {
+            if (t.letter_chart[e] == idx && t.letter_key[e] == key) {
+                t.letter_val[e] = copy(val)
+                done = true
+            }
+            e = e + 1
+        }
+        if (!done) {
+            arrays.push(t.letter_chart, idx)
+            arrays.push(t.letter_key, key)
+            arrays.push(t.letter_val, val)
+        }
+    }
+}
+
+fun romanize_parse_words(view mut RomanizeTable t, view string obj) {
+    var words = json.get(obj, "words")
+    if (words == "null") {
+        return
+    }
+    var keys = strings.split(json.keys(words), ",")
+    var rest = keys
+    var nl = strings.from_char_code(10)
+    while (!strings.is_empty(rest)) {
+        var at = strings.index_of(rest, nl, 0)
+        var key = copy(rest)
+        if (at != -1) {
+            key = strings.substring(rest, 0, at)
+            rest = strings.substring(rest, at + 1, -1)
+        } else {
+            rest = ""
+        }
+        key = strings.trim(key)
+        if (key == "") {
+            continue
+        }
+        var val = util_json_string(json.get(words, key))
+        var e = 0
+        var done = false
+        while (e < arrays.length(t.word_keys)) {
+            if (t.word_keys[e] == key) {
+                t.word_vals[e] = copy(val)
+                done = true
+            }
+            e = e + 1
+        }
+        if (!done) {
+            arrays.push(t.word_keys, key)
+            arrays.push(t.word_vals, val)
+        }
+    }
+}
+
+fun romanize_dialect_id(string s) -> int {
+    if (s == "hindi") {
+        return dialect_hindi
+    }
+    if (s == "bengali") {
+        return dialect_bengali
+    }
+    if (s == "punjabi") {
+        return dialect_punjabi
+    }
+    return dialect_plain
+}
+
+fun romanize_parse_abugida(view mut RomanizeTable t, view string obj) {
+    var name = util_json_string(json.get(obj, "name"))
+    if (name == "") {
+        throw "abugida without a name"
+    }
+    var idx = romanize_ab_index(t, name)
+    if (idx == -1) {
+        arrays.push(t.ab_names, name)
+        arrays.push(t.ab_dialect, romanize_dialect_id(util_json_string(json.get(obj, "dialect"))))
+        arrays.push(t.ab_start, romanize_get_int(obj, "range_start"))
+        arrays.push(t.ab_end, romanize_get_int(obj, "range_end"))
+        arrays.push(t.ab_punct, util_json_string(json.get(obj, "punctuation")))
+        arrays.push(t.ab_halant, util_json_string(json.get(obj, "halant")))
+        arrays.push(t.ab_anusvara, util_json_string(json.get(obj, "anusvara")))
+        arrays.push(t.ab_candra, util_json_string(json.get(obj, "candrabindu")))
+        arrays.push(t.ab_visarga, util_json_string(json.get(obj, "visarga")))
+        arrays.push(t.ab_nukta, util_json_string(json.get(obj, "nukta")))
+        arrays.push(t.ab_gemination, util_json_string(json.get(obj, "gemination")))
+        arrays.push(t.ab_inherent, util_json_string(json.get(obj, "inherent")))
+        arrays.push(t.ab_labials, util_json_string(json.get(obj, "labials")))
+        arrays.push(t.ab_digits, util_json_string(json.get(obj, "digits")))
+        idx = arrays.length(t.ab_names) - 1
+    } else {
+        romanize_overlay_abugida(t, idx, obj)
+    }
+    romanize_parse_map(t, idx, obj, "consonants", map_consonant)
+    romanize_parse_map(t, idx, obj, "vowels", map_vowel)
+    romanize_parse_map(t, idx, obj, "matras", map_matra)
+    romanize_parse_map(t, idx, obj, "conjuncts", map_conjunct)
+    romanize_parse_map(t, idx, obj, "nukta_forms", map_nukta)
+    romanize_parse_map(t, idx, obj, "conjunct_letters", map_conjunct_letter)
+}
+
+fun romanize_get_int(view string obj, view string key) -> int {
+    var v = json.get(obj, key)
+    if (v == "null") {
+        return 0
+    }
+    return fmt.to_int(v)
+}
+
+fun romanize_parse_map(view mut RomanizeTable t, int ab, view string obj, view string key, int kind) {
+    var m = json.get(obj, key)
+    if (m == "null") {
+        return
+    }
+    var keys = strings.split(json.keys(m), ",")
+    var rest = keys
+    var nl = strings.from_char_code(10)
+    while (!strings.is_empty(rest)) {
+        var at = strings.index_of(rest, nl, 0)
+        var k = copy(rest)
+        if (at != -1) {
+            k = strings.substring(rest, 0, at)
+            rest = strings.substring(rest, at + 1, -1)
+        } else {
+            rest = ""
+        }
+        k = strings.trim(k)
+        if (k == "") {
+            continue
+        }
+        var val = util_json_string(json.get(m, k))
+        var e = 0
+        var done = false
+        while (e < arrays.length(t.map_key)) {
+            if (t.map_ab[e] == ab && t.map_kind[e] == kind && t.map_key[e] == k) {
+                t.map_val[e] = copy(val)
+                done = true
+            }
+            e = e + 1
+        }
+        if (!done) {
+            arrays.push(t.map_ab, ab)
+            arrays.push(t.map_kind, kind)
+            arrays.push(t.map_key, k)
+            arrays.push(t.map_val, val)
+        }
+    }
+}
+
+fun romanize_overlay_abugida(view mut RomanizeTable t, int idx, view string obj) {
+    var start = romanize_get_int(obj, "range_start")
+    if (start != 0) {
+        t.ab_start[idx] = start
+    }
+    var end = romanize_get_int(obj, "range_end")
+    if (end != 0) {
+        t.ab_end[idx] = end
+    }
+    var halant = util_json_string(json.get(obj, "halant"))
+    if (halant != "") {
+        t.ab_halant[idx] = halant
+    }
+    var anusvara = util_json_string(json.get(obj, "anusvara"))
+    if (anusvara != "") {
+        t.ab_anusvara[idx] = anusvara
+    }
+    var candra = util_json_string(json.get(obj, "candrabindu"))
+    if (candra != "") {
+        t.ab_candra[idx] = candra
+    }
+    var visarga = util_json_string(json.get(obj, "visarga"))
+    if (visarga != "") {
+        t.ab_visarga[idx] = visarga
+    }
+    var nukta = util_json_string(json.get(obj, "nukta"))
+    if (nukta != "") {
+        t.ab_nukta[idx] = nukta
+    }
+    var gemination = util_json_string(json.get(obj, "gemination"))
+    if (gemination != "") {
+        t.ab_gemination[idx] = gemination
+    }
+    var inherent = util_json_string(json.get(obj, "inherent"))
+    if (inherent != "") {
+        t.ab_inherent[idx] = inherent
+    }
+    var punct = util_json_string(json.get(obj, "punctuation"))
+    if (punct != "") {
+        t.ab_punct[idx] = punct
+    }
+    var labials = util_json_string(json.get(obj, "labials"))
+    if (labials != "") {
+        t.ab_labials[idx] = labials
+    }
+    var digits = util_json_string(json.get(obj, "digits"))
+    if (digits != "") {
+        t.ab_digits[idx] = digits
+    }
+}
+
+fun romanize_sort_words(view mut RomanizeTable t) {
+    var n = arrays.length(t.word_keys)
+    var i = 1
+    while (i < n) {
+        var kk = copy(t.word_keys[i])
+        var vv = copy(t.word_vals[i])
+        var j = i
+        while (j > 0 && util_char_count(t.word_keys[j - 1]) < util_char_count(kk)) {
+            t.word_keys[j] = t.word_keys[j - 1]
+            t.word_vals[j] = t.word_vals[j - 1]
+            j = j - 1
+        }
+        t.word_keys[j] = kk
+        t.word_vals[j] = vv
+        i = i + 1
+    }
+}
+
+fun romanize_nasal(view RomanizeTable t, int ab, view string next_onset, bool candrabindu) -> string {
+    if (next_onset != "" && strings.contains(t.ab_labials[ab], next_onset)) {
+        return "m"
+    }
+    if (candrabindu) {
+        return "n"
+    }
+    if (t.ab_dialect[ab] == dialect_punjabi && next_onset == "") {
+        return ""
+    }
+    if (t.ab_dialect[ab] == dialect_bengali && next_onset != "") {
+        return "ng"
+    }
+    return "n"
+}
+
+fun romanize_indic(view RomanizeTable t, view array[string] chars, int start, int end, int ab) -> string {
+    var array[string] onsets = arrays.fill("", 0)
+    var array[int] vkinds = arrays.fill(0, 0)
+    var array[string] vtexts = arrays.fill("", 0)
+    var array[bool] nasals = arrays.fill(false, 0)
+    var array[bool] candras = arrays.fill(false, 0)
+    var array[bool] visargas = arrays.fill(false, 0)
+    var array[string] specials = arrays.fill("", 0)
+    var array[bool] covereds = arrays.fill(false, 0)
+    var array[bool] geminateds = arrays.fill(false, 0)
+    var geminate_next = false
+    var i = start
+    while (i < end) {
+        var c = copy(chars[i])
+        if (c == t.ab_halant[ab] && t.ab_halant[ab] != "") {
+            var n = arrays.length(onsets)
+            if (n > 0) {
+                if (onsets[n - 1] != "") {
+                    vkinds[n - 1] = 1
+                }
+            }
+            i = i + 1
+            continue
+        }
+        var (has_matra, matra) = romanize_map_get(t, ab, map_matra, c)
+        if (has_matra) {
+            var n = arrays.length(onsets)
+            if (n > 0 && onsets[n - 1] != "") {
+                vkinds[n - 1] = 2
+                vtexts[n - 1] = matra
+            }
+            i = i + 1
+            continue
+        }
+        if (c == t.ab_anusvara[ab] && t.ab_anusvara[ab] != "") {
+            var n = arrays.length(onsets)
+            if (n > 0) {
+                nasals[n - 1] = true
+            } else {
+                arrays.push(onsets, "")
+                arrays.push(vkinds, 0)
+                arrays.push(vtexts, "")
+                arrays.push(nasals, true)
+                arrays.push(candras, false)
+                arrays.push(visargas, false)
+                arrays.push(specials, "")
+                arrays.push(covereds, false)
+                arrays.push(geminateds, false)
+            }
+            i = i + 1
+            continue
+        }
+        if (c == t.ab_candra[ab] && t.ab_candra[ab] != "") {
+            var n = arrays.length(onsets)
+            if (n > 0) {
+                candras[n - 1] = true
+            } else {
+                arrays.push(onsets, "")
+                arrays.push(vkinds, 0)
+                arrays.push(vtexts, "")
+                arrays.push(nasals, false)
+                arrays.push(candras, true)
+                arrays.push(visargas, false)
+                arrays.push(specials, "")
+                arrays.push(covereds, false)
+                arrays.push(geminateds, false)
+            }
+            i = i + 1
+            continue
+        }
+        if (c == t.ab_visarga[ab] && t.ab_visarga[ab] != "") {
+            var n = arrays.length(onsets)
+            if (n > 0) {
+                visargas[n - 1] = true
+            }
+            i = i + 1
+            continue
+        }
+        if (t.ab_nukta[ab] != "" && c == t.ab_nukta[ab]) {
+            var n = arrays.length(onsets)
+            if (n > 0 && onsets[n - 1] != "") {
+                var (found, composed) = romanize_map_get(t, ab, map_nukta, onsets[n - 1])
+                if (found) {
+                    onsets[n - 1] = composed
+                }
+            }
+            i = i + 1
+            continue
+        }
+        var (has_vowel, vowel) = romanize_map_get(t, ab, map_vowel, c)
+        if (has_vowel) {
+            arrays.push(onsets, "")
+            arrays.push(vkinds, 2)
+            arrays.push(vtexts, vowel)
+            arrays.push(nasals, false)
+            arrays.push(candras, false)
+            arrays.push(visargas, false)
+            arrays.push(specials, "")
+            arrays.push(covereds, false)
+            arrays.push(geminateds, false)
+            i = i + 1
+            continue
+        }
+        if (t.ab_gemination[ab] != "" && c == t.ab_gemination[ab]) {
+            geminate_next = true
+            i = i + 1
+            continue
+        }
+        var (has_cons, _) = romanize_map_get(t, ab, map_consonant, c)
+        if (has_cons) {
+            var covered = false
+            var n = arrays.length(onsets)
+            if (n > 0 && onsets[n - 1] != "" && vkinds[n - 1] == 1 && specials[n - 1] == "") {
+                var (found, romaji) = romanize_conjunct(t, ab, onsets[n - 1], c)
+                if (found) {
+                    specials[n - 1] = romaji
+                    covered = true
+                }
+            }
+            arrays.push(onsets, copy(c))
+            arrays.push(vkinds, 0)
+            arrays.push(vtexts, "")
+            arrays.push(nasals, false)
+            arrays.push(candras, false)
+            arrays.push(visargas, false)
+            arrays.push(specials, "")
+            arrays.push(covereds, covered)
+            arrays.push(geminateds, geminate_next)
+            geminate_next = false
+            i = i + 1
+            continue
+        }
+        var digit = romanize_digit_value(t, ab, c)
+        if (digit != "") {
+            arrays.push(onsets, digit)
+            arrays.push(vkinds, 2)
+            arrays.push(vtexts, "")
+            arrays.push(nasals, false)
+            arrays.push(candras, false)
+            arrays.push(visargas, false)
+            arrays.push(specials, "")
+            arrays.push(covereds, false)
+            arrays.push(geminateds, false)
+            i = i + 1
+            continue
+        }
+        arrays.push(onsets, c)
+        arrays.push(vkinds, 2)
+        arrays.push(vtexts, "")
+        arrays.push(nasals, false)
+        arrays.push(candras, false)
+        arrays.push(visargas, false)
+        arrays.push(specials, "")
+        arrays.push(covereds, false)
+        arrays.push(geminateds, false)
+        i = i + 1
+    }
+    var count = arrays.length(onsets)
+    if (count >= 2 && vkinds[count - 1] == 0) {
+        var conjunct_prev = vkinds[count - 2] == 1
+        var keep = false
+        if (t.ab_dialect[ab] == dialect_bengali && conjunct_prev) {
+            keep = true
+        }
+        if (t.ab_dialect[ab] == dialect_hindi && conjunct_prev) {
+            var last_onset = copy(onsets[count - 1])
+            if (last_onset == "य" || last_onset == "व" || last_onset == "र") {
+                keep = true
+            }
+        }
+        if (!keep) {
+            vkinds[count - 1] = 1
+        }
+    }
+    var out = ""
+    var k = 0
+    while (k < count) {
+        var next_onset = ""
+        if (k + 1 < count) {
+            next_onset = copy(onsets[k + 1])
+        }
+        if (specials[k] != "") {
+            out = out + specials[k]
+        } else {
+            if (!covereds[k] && onsets[k] != "") {
+                var romaji = ""
+                if (vkinds[k] == 1) {
+                    var (found, letters) = romanize_map_get(t, ab, map_conjunct_letter, onsets[k])
+                    if (found) {
+                        romaji = letters
+                    } else {
+                        var (found2, cons2) = romanize_map_get(t, ab, map_consonant, onsets[k])
+                        if (found2) {
+                            romaji = cons2
+                        }
+                    }
+                } else {
+                    var (found, cons) = romanize_map_get(t, ab, map_consonant, onsets[k])
+                    if (found) {
+                        romaji = cons
+                    }
+                }
+                if (romaji != "") {
+                    if (geminateds[k]) {
+                        out = out + util_first_char(romaji)
+                    }
+                    out = out + romaji
+                } else {
+                    out = out + onsets[k]
+                }
+            }
+        }
+        if (vkinds[k] == 0) {
+            out = out + t.ab_inherent[ab]
+        } else {
+            if (vkinds[k] == 2) {
+                out = out + vtexts[k]
+            }
+        }
+        if (!candras[k] && nasals[k]) {
+            out = out + romanize_nasal(t, ab, next_onset, false)
+        }
+        if (visargas[k]) {
+            out = out + "h"
+        }
+        k = k + 1
+    }
+    return out
+}
+
+fun romanize_conjunct(view RomanizeTable t, int ab, view string c1, view string c2) -> (bool, string) {
+    var key = copy(c1) + t.ab_halant[ab] + copy(c2)
+    return romanize_map_get(t, ab, map_conjunct, key)
+}
+
+fun romanize_test_table() -> RomanizeTable {
+    return romanize_load("/tmp/mewsic-romanize-test")
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+fun romanize_digit_value(view RomanizeTable t, int ab, view string ch) -> string {
+    var digits = copy(t.ab_digits[ab])
+    var rest = strings.split(digits, "")
+    var nl = strings.from_char_code(10)
+    var idx = 0
+    while (!strings.is_empty(rest)) {
+        var at = strings.index_of(rest, nl, 0)
+        var d = copy(rest)
+        if (at != -1) {
+            d = strings.substring(rest, 0, at)
+            rest = strings.substring(rest, at + 1, -1)
+        } else {
+            rest = ""
+        }
+        if (d == ch) {
+            return strings.char_at("0123456789", idx)
+        }
+        idx = idx + 1
+    }
+    return ""
+}
+
+
+
+
+test romanize_latin_passthrough {
+    var t = romanize_test_table()
+    testing.assert_true(romanize_romanize("Hello world 123!", t) == "Hello world 123!")
+}
+
+test romanize_japanese_kana {
+    var t = romanize_test_table()
+    testing.assert_true(romanize_romanize("さくら", t) == "sakura")
+    testing.assert_true(romanize_romanize("ありがとう", t) == "arigatou")
+    testing.assert_true(romanize_romanize("にほんご", t) == "nihongo")
+    testing.assert_true(romanize_romanize("しんぶん", t) == "shinbun")
+    testing.assert_true(romanize_romanize("コーヒー", t) == "koohii")
+}
+
+test romanize_korean_hangul {
+    var t = romanize_test_table()
+    testing.assert_true(romanize_romanize("안녕하세요", t) == "annyeonghaseyo")
+    testing.assert_true(romanize_romanize("사랑해", t) == "salanghae")
+}
+
+test romanize_cyrillic {
+    var t = romanize_test_table()
+    testing.assert_true(romanize_romanize("Привет", t) == "Privet")
+    testing.assert_true(romanize_romanize("спасибо", t) == "spasibo")
+    testing.assert_true(romanize_romanize("Москва", t) == "Moskva")
+}
+
+test romanize_greek {
+    var t = romanize_test_table()
+    testing.assert_true(romanize_romanize("Καλημέρα", t) == "Kalimera")
+    testing.assert_true(romanize_romanize("αγάπη", t) == "agapi")
+}
+
+test romanize_arabic {
+    var t = romanize_test_table()
+    testing.assert_true(romanize_romanize("كتاب", t) == "ktb")
+    testing.assert_true(romanize_romanize("سلام", t) == "slm")
+}
+
+test romanize_hindi {
+    var t = romanize_test_table()
+    testing.assert_true(romanize_romanize("नमस्ते", t) == "namaste")
+    testing.assert_true(romanize_romanize("किताब", t) == "kitaab")
+    testing.assert_true(romanize_romanize("दिल", t) == "dil")
+    testing.assert_true(romanize_romanize("मैं तुमसे प्यार करता हूँ", t) == "main tumase pyaar karataa huu")
+}
+
+test romanize_bengali {
+    var t = romanize_test_table()
+    testing.assert_true(romanize_romanize("বাংলা", t) == "bangla")
+    testing.assert_true(romanize_romanize("ধন্যবাদ", t) == "dhonnobad")
+    testing.assert_true(romanize_romanize("আমি বাংলায় গান গাই", t) == "ami banglay gan gai")
+}
+
+test romanize_punjabi {
+    var t = romanize_test_table()
+    testing.assert_true(romanize_romanize("ਤੇਰੀ", t) == "teri")
+    testing.assert_true(romanize_romanize("ਦਿਲ", t) == "dil")
+    testing.assert_true(romanize_romanize("ਸਤ ਸ੍ਰੀ ਅਕਾਲ", t) == "sat sri akal")
+}
+
+test romanize_indic_digits {
+    var t = romanize_test_table()
+    testing.assert_true(romanize_romanize("१२३", t) == "123")
+    testing.assert_true(romanize_romanize("गाना २", t) == "gaanaa 2")
+}
+
+test romanize_builtin_table_loads {
+    var t = romanize_test_table()
+    testing.assert_true(t.chart_count() >= 2)
+    testing.assert_true(t.abugida_count() == 2)
+    testing.assert_true(romanize_chart_map(t, "а") == "a")
+    testing.assert_true(romanize_chart_map(t, "Ж") == "Zh")
+}
+
+test romanize_user_overlay {
+    var dir = "/tmp/mewsic-romanize-merge"
+    sys.mkdir(dir + "/romanize")
+    sys.write(dir + "/romanize/cyrillic.toml", "[[scripts]]
+name = 'cyrillic'
+kind = 'chart'
+capitalize_first = true
+[scripts.letters]
+'х' = 'h'
+")
+    sys.write(dir + "/romanize/georgian.toml", "[[scripts]]
+name = 'georgian'
+kind = 'chart'
+[scripts.letters]
+'ა' = 'a'
+'ბ' = 'b'
+")
+    var t = romanize_load(dir)
+    testing.assert_true(romanize_chart_map(t, "х") == "h")
+    testing.assert_true(romanize_chart_map(t, "а") == "a")
+    testing.assert_true(romanize_chart_map(t, "ა") == "a")
+    testing.assert_true(romanize_chart_map(t, "ბ") == "b")
+    sys.rm(dir + "/romanize/cyrillic.toml")
+    sys.rm(dir + "/romanize/georgian.toml")
+}
+
+test romanize_invalid_toml_ignored {
+    var dir = "/tmp/mewsic-romanize-bad"
+    sys.mkdir(dir + "/romanize")
+    sys.write(dir + "/romanize/cyrillic.toml", "this is { not toml")
+    var t = romanize_load(dir)
+    testing.assert_true(romanize_chart_map(t, "а") == "a")
+    sys.rm(dir + "/romanize/cyrillic.toml")
+}

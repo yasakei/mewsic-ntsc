@@ -1,0 +1,141 @@
+use sys
+use os
+use strings
+use json
+use process
+use "log.nt"
+use "util.nt"
+
+fun autostart_apply(string dir, bool enabled) {
+    var err = autostart_apply_inner(enabled)
+    if (err != "") {
+        log_write(dir, "autostart error: " + err)
+    }
+}
+
+fun autostart_apply_inner(bool enabled) -> string {
+    var os_name = autostart_os()
+    if (os_name == "windows") {
+        return autostart_windows(enabled)
+    }
+    if (os_name == "macos") {
+        return autostart_macos(enabled)
+    }
+    return autostart_linux(enabled)
+}
+
+fun autostart_os() -> string {
+    if (os.getenv("OS") == "Windows_NT") {
+        return "windows"
+    }
+    var uname = ""
+    quiet [unused_variable] {
+        try {
+            var out = process.exec_output("uname")
+            uname = json.get(out, "stdout")
+        } catch (e) {
+            return "linux"
+        }
+    }
+    if (strings.starts_with(uname, "Darwin")) {
+        return "macos"
+    }
+    return "linux"
+}
+
+
+
+fun autostart_linux(bool enabled) -> string {
+    var dir = os.getenv("HOME") + "/.config/autostart"
+    var file = dir + "/mewsic.desktop"
+    if (!enabled) {
+        quiet [unused_variable] {
+            try {
+                sys.rm(file)
+            } catch (e) {
+            }
+        }
+        return ""
+    }
+    try {
+        sys.mkdir(dir)
+    } catch (e) {
+        return e
+    }
+    var q = util_dquote()
+    var cmd = q + util_argv0() + q + " background"
+    var content = "[Desktop Entry]
+Type=Application
+Name=mewsic
+Exec=" + cmd + "
+X-GNOME-Autostart-enabled=true
+"
+    try {
+        sys.write(file, content)
+    } catch (e) {
+        return e
+    }
+    return ""
+}
+
+fun autostart_macos(bool enabled) -> string {
+    var dir = os.getenv("HOME") + "/Library/LaunchAgents"
+    var label = "com.mewsic.autostart"
+    var file = dir + "/" + label + ".plist"
+    if (!enabled) {
+        quiet [unused_variable] {
+            try {
+                sys.rm(file)
+            } catch (e) {
+            }
+        }
+        return ""
+    }
+    try {
+        sys.mkdir(dir)
+    } catch (e) {
+        return e
+    }
+    var exe = util_argv0()
+    var content = "<?xml version=" + util_dquote() + "1.0" + util_dquote() + " encoding=" + util_dquote() + "UTF-8" + util_dquote() + ">
+<!DOCTYPE plist PUBLIC " + util_dquote() + "-//Apple//DTD PLIST 1.0//EN" + util_dquote() + " " + util_dquote() + "http://www.apple.com/DTDs/PropertyList-1.0.dtd" + util_dquote() + ">
+<plist version=" + util_dquote() + "1.0" + util_dquote() + ">
+<dict>
+ <key>Label</key><string>" + label + "</string>
+ <key>ProgramArguments</key>
+ <array>
+  <string>" + exe + "</string>
+  <string>background</string>
+ </array>
+ <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+"
+    try {
+        sys.write(file, content)
+    } catch (e) {
+        return e
+    }
+    return ""
+}
+
+fun autostart_windows(bool enabled) -> string {
+    var key = "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+    if (!enabled) {
+        quiet [unused_variable] {
+            try {
+                process.spawn("reg", "delete " + key + " /v mewsic /f")
+            } catch (e) {
+            }
+        }
+        return ""
+    }
+    var q = util_dquote()
+    var value = q + util_argv0() + " background" + q
+    try {
+        process.spawn("reg", "add " + key + " /v mewsic /t REG_SZ /d " + value + " /f")
+    } catch (e) {
+        return e
+    }
+    return ""
+}

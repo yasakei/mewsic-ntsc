@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mewsic · control panel</title>
+<script>
+  tailwind.config = {
+    darkMode: 'class',
+    theme: { extend: {} }
+  };
+</script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+    document.documentElement.classList.add('dark');
+  }
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
+    document.documentElement.classList.toggle('dark', e.matches);
+  });
+</script>
+<style>
+  :root {
+    --mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  body { font-family: var(--sans); }
+
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #a1a1aa; display: inline-block;
+  }
+  .dot.on {
+    background: #10b981;
+    box-shadow: 0 0 8px rgba(16, 185, 129, .7);
+    animation: pulse 1.6s infinite;
+  }
+  .dot.off { background: #ef4444; }
+  @keyframes pulse { 50% { opacity: .4; } }
+
+  .saved-flag {
+    position: fixed; bottom: 22px; right: 22px;
+    background: #10b981; color: #04140c;
+    font-family: var(--mono); font-size: 12px; font-weight: 700;
+    padding: 10px 16px; border-radius: 999px;
+    opacity: 0; transform: translateY(8px); transition: all .3s;
+    pointer-events: none; box-shadow: 0 6px 20px rgba(16, 185, 129, .35);
+    z-index: 50;
+  }
+  .saved-flag.show { opacity: 1; transform: translateY(0); }
+
+  #checkToken {
+    display: inline-flex; align-items: center; justify-content: center;
+    height: 36px; padding: 0 14px; border-radius: 8px;
+    border: 1px solid #d4d4d8; background: #fff; color: #18181b;
+    font-family: var(--mono); font-size: 12px; font-weight: 500;
+    cursor: pointer; transition: all .15s; white-space: nowrap;
+  }
+  #checkToken:hover { border-color: #8b5cf6; color: #8b5cf6; background: #fafafa; }
+  #checkToken:disabled { opacity: .6; cursor: default; }
+  #checkToken.ok { border-color: #10b981; color: #10b981; }
+  #checkToken.err { border-color: #ef4444; color: #ef4444; }
+  html.dark #checkToken {
+    border-color: #3f3f46; background: #18181b; color: #e4e4e7;
+  }
+  html.dark #checkToken:hover { border-color: #a78bfa; color: #a78bfa; background: #1f1f23; }
+  html.dark #checkToken.ok { border-color: #34d399; color: #34d399; }
+  html.dark #checkToken.err { border-color: #f87171; color: #f87171; }
+
+  :root {
+    --ink: #171717;
+    --paper: #f6f1e8;
+    --card: #fffdf8;
+    --line: #171717;
+    --acid: #d7ff45;
+    --pink: #ff86c8;
+    --blue: #78c8ff;
+    --orange: #ff9d4d;
+    --violet: #9b7bff;
+    --mint: #83e6c0;
+    --shadow: 7px 7px 0 var(--ink);
+  }
+  html.dark {
+    --ink: #171717;
+    --paper: #171717;
+    --card: #fffdf8;
+    --line: #171717;
+    --shadow: 7px 7px 0 #f8f3ea;
+  }
+  body { background: var(--paper) !important; color: var(--ink) !important; }
+  body > div:first-of-type {
+    max-width: 1180px !important;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 22px;
+    padding-top: 28px !important;
+    padding-bottom: 52px !important;
+  }
+  header {
+    grid-column: 1 / -1;
+    margin-bottom: 2px !important;
+    padding: 0 0 20px !important;
+    border-bottom: 3px solid var(--line) !important;
+  }
+  html.dark header { border-color: #f8f3ea !important; }
+  header > div:first-child {
+    height: 48px !important; width: 64px !important; border-radius: 0 !important;
+    padding: 9px 12px !important; background: var(--acid) !important; color: var(--ink) !important;
+    border: 3px solid var(--line); box-shadow: 4px 4px 0 var(--line);
+    font-family: var(--mono); font-size: 13px !important; letter-spacing: .12em;
+    justify-content: center;
+  }
+  .cat-mark { width: 42px; height: 36px; display: block; }
+  .cat-mark .face { fill: var(--acid); stroke: var(--ink); stroke-width: 2.5; stroke-linejoin: round; }
+  .cat-mark .ear { fill: var(--pink); stroke: var(--ink); stroke-width: 1.5; stroke-linejoin: round; }
+  .cat-mark .eye, .cat-mark .nose, .cat-mark .mouth { fill: var(--ink); }
+  .cat-mark .highlight { fill: var(--acid); }
+  .cat-mark .whisker { stroke: var(--ink); stroke-width: 1.3; stroke-linecap: round; }
+  header h1 { font-size: 28px !important; line-height: 1 !important; text-transform: uppercase; letter-spacing: -.04em !important; }
+  header p { color: var(--ink) !important; opacity: .68; font-family: var(--mono); font-size: 11px !important; }
+  html.dark header h1, html.dark header p { color: #f8f3ea !important; }
+  #live { border: 3px solid var(--line) !important; border-radius: 0 !important; color: var(--ink) !important; background: var(--pink); box-shadow: 4px 4px 0 var(--line); }
+  .dot { border-radius: 0 !important; background: var(--ink); }
+  .dot.on { background: #16855d; box-shadow: none; }
+  .dot.off { background: #d44545; }
+  #updBanner { grid-column: 1 / -1; margin: 0 !important; border: 3px solid var(--line) !important; border-radius: 0 !important; background: var(--orange) !important; color: var(--ink) !important; box-shadow: var(--shadow); }
+  section { margin: 0 !important; border: 3px solid var(--line) !important; border-radius: 0 !important; background: var(--card) !important; box-shadow: var(--shadow); }
+  section:nth-of-type(1) { grid-column: 1 / -1; background: var(--blue) !important; }
+  section:nth-of-type(2) { grid-column: 1; background: var(--card) !important; }
+  section:nth-of-type(3) { grid-column: 2; background: var(--mint) !important; }
+  section:nth-of-type(4) { grid-column: 1; background: var(--card) !important; }
+  section:nth-of-type(5) { grid-column: 2; background: var(--orange) !important; }
+  section:nth-of-type(6) { grid-column: 1 / -1; background: var(--violet) !important; }
+  section > h2 { color: var(--ink) !important; opacity: .72; letter-spacing: .2em !important; border-bottom: 2px solid var(--line); padding-bottom: 10px; }
+  section:nth-of-type(1) > h2 { opacity: 1; }
+  section:nth-of-type(1) #npTitle { font-size: 31px; line-height: 1.05; letter-spacing: -.04em; }
+  section:nth-of-type(1) #npArtist { color: var(--ink) !important; opacity: .72; }
+  section:nth-of-type(1) #npBar { background: var(--ink) !important; border-radius: 0 !important; }
+  section:nth-of-type(1) .h-1\.5 { background: rgba(23,23,23,.2) !important; border-radius: 0 !important; }
+  #npLine, #preview { border: 2px dashed var(--line) !important; border-radius: 0 !important; background: rgba(255,255,255,.35) !important; color: var(--ink) !important; }
+  section .text-zinc-400, section .text-zinc-500, section .text-zinc-600,
+  section .text-zinc-300, section .text-zinc-100,
+  label, section p, small, section span, section b { color: var(--ink) !important; }
+  section label, section p, section small { opacity: .92; line-height: 1.35; }
+  section label { font-weight: 650 !important; }
+  section > .divide-y > div > label, section > div > div > label { white-space: nowrap; }
+  section > .divide-y > div > small, section > p { display: block; width: calc(100% - 176px) !important; margin-left: 176px !important; padding-left: 0 !important; }
+  section b { opacity: 1; }
+  section input::placeholder, section textarea::placeholder { color: var(--ink) !important; opacity: .52; }
+  section > .divide-y > div > label, section > div > div > label { min-width: 164px; }
+  #lastfmRow label { min-width: 164px; }
+  #npTime, #npSource, #npPing, #npAuto { opacity: .8; }
+  input, select, textarea { border: 2px solid var(--line) !important; border-radius: 0 !important; background: var(--card) !important; color: var(--ink) !important; box-shadow: 3px 3px 0 var(--line); }
+  input:focus, select:focus, textarea:focus { border-color: var(--line) !important; box-shadow: 4px 4px 0 var(--line) !important; outline: 2px solid var(--acid) !important; }
+  #checkToken { height: 36px; border: 2px solid var(--line) !important; border-radius: 0 !important; background: var(--acid) !important; color: var(--ink) !important; box-shadow: 3px 3px 0 var(--line); }
+  #checkToken:hover { border-color: var(--line) !important; color: var(--ink) !important; background: var(--pink) !important; }
+  #checkToken.ok { background: var(--mint) !important; border-color: var(--line) !important; color: var(--ink) !important; }
+  #checkToken.err { background: #ff6868 !important; border-color: var(--line) !important; color: var(--ink) !important; }
+  .peer + div { border-radius: 0 !important; border: 2px solid var(--line); background: rgba(255,255,255,.45) !important; }
+  .peer:checked + div { background: #f04f9d !important; border-color: var(--line) !important; }
+  .peer + div::after { border-radius: 0 !important; background: #fffdf8 !important; box-shadow: none !important; }
+  .saved-flag { right: 24px; bottom: 24px; border: 3px solid var(--line); border-radius: 0; background: var(--acid); color: var(--ink); box-shadow: 5px 5px 0 var(--line); }
+  @media (max-width: 800px) {
+    body > div:first-of-type { display: block; padding: 18px !important; }
+    header { margin-bottom: 20px !important; }
+    section, #updBanner { margin-bottom: 20px !important; }
+    section > .divide-y > div > small, section > p { width: 100% !important; margin-left: 0 !important; }
+  }
+  @media (min-width: 801px) and (max-width: 1020px) {
+    body > div:first-of-type { grid-template-columns: 1fr; }
+    section:nth-of-type(n) { grid-column: 1; }
+  }
+</style>
+</head>
+<body class="min-h-screen bg-zinc-50 text-zinc-900 antialiased transition-colors dark:bg-zinc-950 dark:text-zinc-100">
+<div class="mx-auto max-w-2xl px-5 py-10 sm:px-6">
+  <header class="mb-8 flex items-center gap-4 border-b border-zinc-200 pb-6 dark:border-zinc-800">
+    <div class="flex h-10 shrink-0 items-center rounded-xl bg-violet-600 px-3 font-mono text-sm font-bold text-white shadow-sm" aria-label="mewsic cat mascot">
+      <svg class="cat-mark" viewBox="0 0 48 40" role="img" aria-hidden="true">
+        <path class="face" d="M7 14 8 5l9 6c2-1 4-2 7-2s5 1 7 2l9-6 1 9v13c0 7-6 11-16 11S7 34 7 27Z"/>
+        <path class="ear" d="m10 9 6 4-5 2Z"/><path class="ear" d="m38 9-6 4 5 2Z"/>
+        <ellipse class="eye" cx="17" cy="22" rx="3" ry="3.5"/><ellipse class="eye" cx="31" cy="22" rx="3" ry="3.5"/>
+        <circle class="highlight" cx="18" cy="21" r=".9"/><circle class="highlight" cx="32" cy="21" r=".9"/>
+        <path class="nose" d="m22 27 2-1.5 2 1.5-2 2Z"/>
+        <path class="mouth" d="M24 29v2M24 31c-2 2-3 2-4 1M24 31c2 2 3 2 4 1" stroke="var(--ink)" stroke-width="1.3" fill="none" stroke-linecap="round"/>
+        <path class="whisker" d="M15 27 3 24M15 30 3 30M33 27l12-3M33 30l12 0"/>
+      </svg>
+    </div>
+    <div class="min-w-0">
+      <h1 class="text-lg font-semibold tracking-tight">mewsic</h1>
+      <p class="mt-0.5 truncate text-xs text-zinc-500 dark:text-zinc-400">line-by-line status control deck</p>
+    </div>
+    <div class="flex-1"></div>
+    <span id="live" class="inline-flex shrink-0 items-center gap-2 rounded-full border border-zinc-200 px-3 py-1 font-mono text-[11px] text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
+      <span id="dot" class="dot"></span><span id="liveText">connecting…</span>
+    </span>
+  </header>
+
+  <div id="updBanner" class="mb-5 hidden rounded-lg border border-violet-200 bg-violet-50 px-4 py-3 font-mono text-xs text-violet-700 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-300"></div>
+
+  <section class="mb-5 rounded-xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+    <h2 class="mb-5 font-mono text-[11px] font-medium uppercase tracking-[0.15em] text-zinc-400 dark:text-zinc-500">now playing</h2>
+    <div class="text-base font-semibold" id="npTitle">NO TRACK</div>
+    <div class="mt-0.5 text-sm text-zinc-500 dark:text-zinc-400" id="npArtist">NO ARTIST</div>
+    <div class="mt-4 h-1.5 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
+      <i id="npBar" class="block h-full w-0 rounded-full bg-violet-600 transition-[width] duration-300 ease-out"></i>
+    </div>
+    <div class="mt-1.5 font-mono text-[11px] text-zinc-400 dark:text-zinc-500" id="npTime">0:00 / 0:00</div>
+    <div class="mt-4 min-h-11 rounded-lg border border-dashed border-zinc-300 bg-zinc-50 px-3.5 py-3 font-mono text-[13px] dark:border-zinc-700 dark:bg-zinc-950/60" id="npLine">WAITING FOR PLAYBACK</div>
+    <div class="mt-4 flex flex-wrap gap-x-5 gap-y-1 font-mono text-[11px] text-zinc-400 dark:text-zinc-500">
+      <span>source <b class="font-semibold text-zinc-600 dark:text-zinc-300" id="npSource">NONE</b></span>
+      <span>ping <b class="font-semibold text-zinc-600 dark:text-zinc-300" id="npPing">NONE</b></span>
+      <span>autooffset <b class="font-semibold text-zinc-600 dark:text-zinc-300" id="npAuto">NONE</b></span>
+    </div>
+  </section>
+
+  <section class="mb-5 rounded-xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+    <h2 class="mb-5 font-mono text-[11px] font-medium uppercase tracking-[0.15em] text-zinc-400 dark:text-zinc-500">account</h2>
+    <div class="flex flex-wrap items-center gap-3">
+      <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="token">Discord token</label>
+      <div class="flex min-w-0 flex-1 items-center gap-2">
+        <input type="text" id="token" autocomplete="off" placeholder="paste your Discord user token"
+               class="h-9 w-full rounded-md border border-zinc-200 bg-white px-3 font-mono text-[13px] outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60 dark:placeholder:text-zinc-500">
+        <button id="checkToken">check</button>
+      </div>
+    </div>
+    <div class="flex flex-wrap items-center gap-3 pt-3.5">
+      <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="source">Music source</label>
+      <div class="flex min-w-0 flex-1 items-center gap-2">
+        <select id="source"
+                class="h-9 w-full max-w-[280px] rounded-md border border-zinc-200 bg-white px-2 font-mono text-[13px] outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60 dark:text-zinc-100">
+          <option value="spotify">Spotify via Discord</option>
+          <option value="lastfm">Last.fm / YouTube Music</option>
+        </select>
+      </div>
+    </div>
+    <div id="lastfmRow" class="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+      <div class="flex flex-wrap items-center gap-3 pt-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="lastfmKey">Last.fm API key</label>
+        <div class="flex min-w-0 flex-1 items-center justify-end">
+          <input type="text" id="lastfmKey" placeholder="free key at last.fm/api/account/create"
+                 class="h-9 w-full max-w-[280px] rounded-md border border-zinc-200 bg-white px-3 font-mono text-[13px] outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60 dark:placeholder:text-zinc-500">
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 pt-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="lastfmUser">Last.fm username</label>
+        <div class="flex min-w-0 flex-1 items-center justify-end">
+          <input type="text" id="lastfmUser" placeholder="your last.fm username"
+                 class="h-9 w-full max-w-[280px] rounded-md border border-zinc-200 bg-white px-3 font-mono text-[13px] outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60 dark:placeholder:text-zinc-500">
+        </div>
+      </div>
+    </div>
+    <p class="mt-2 text-[11px] text-zinc-400 sm:pl-[156px] dark:text-zinc-500">Settings are stored in settings.toml; the Discord token lives in your OS keychain, not in plaintext. Last.fm covers YouTube Music and any player that scrobbles (WebScrobbler, YT Music desktop).</p>
+  </section>
+
+  <section class="mb-5 rounded-xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+    <h2 class="mb-2 font-mono text-[11px] font-medium uppercase tracking-[0.15em] text-zinc-400 dark:text-zinc-500">status</h2>
+    <div class="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="timestamp">Playback timestamp</label>
+        <div class="flex flex-1 items-center justify-end">
+          <label class="relative inline-flex cursor-pointer items-center">
+            <input type="checkbox" id="timestamp" class="peer sr-only">
+            <div class="h-5 w-9 rounded-full bg-zinc-200 transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-4 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:bg-violet-600 peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-violet-500/40 dark:bg-zinc-700"></div>
+          </label>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="label">Show "Song lyrics -" label</label>
+        <div class="flex flex-1 items-center justify-end">
+          <label class="relative inline-flex cursor-pointer items-center">
+            <input type="checkbox" id="label" class="peer sr-only">
+            <div class="h-5 w-9 rounded-full bg-zinc-200 transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-4 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:bg-violet-600 peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-violet-500/40 dark:bg-zinc-700"></div>
+          </label>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="autoClear">Clear on song switch</label>
+        <div class="flex flex-1 items-center justify-end">
+          <label class="relative inline-flex cursor-pointer items-center">
+            <input type="checkbox" id="autoClear" class="peer sr-only">
+            <div class="h-5 w-9 rounded-full bg-zinc-200 transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-4 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:bg-violet-600 peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-violet-500/40 dark:bg-zinc-700"></div>
+          </label>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="emoji">Emoji</label>
+        <div class="flex min-w-0 flex-1 items-center justify-end">
+          <input type="text" id="emoji" placeholder="optional, empty = none"
+                 class="h-9 w-full max-w-[220px] rounded-md border border-zinc-200 bg-white px-3 font-mono text-[13px] outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60 dark:placeholder:text-zinc-500">
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="advanced">Advanced template</label>
+        <div class="flex flex-1 items-center justify-end">
+          <label class="relative inline-flex cursor-pointer items-center">
+            <input type="checkbox" id="advanced" class="peer sr-only">
+            <div class="h-5 w-9 rounded-full bg-zinc-200 transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-4 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:bg-violet-600 peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-violet-500/40 dark:bg-zinc-700"></div>
+          </label>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 py-3.5" id="advRow" style="display:none">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="advEmoji">Template emoji</label>
+        <div class="flex min-w-0 flex-1 items-center justify-end">
+          <input type="text" id="advEmoji" placeholder="optional"
+                 class="h-9 w-full max-w-[220px] rounded-md border border-zinc-200 bg-white px-3 font-mono text-[13px] outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60 dark:placeholder:text-zinc-500">
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 py-3.5" id="advTemplateRow" style="display:none">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="advTemplate">Template</label>
+        <div class="flex min-w-0 flex-1 flex-col gap-1.5">
+          <textarea id="advTemplate" rows="3" class="w-full resize-y rounded-md border border-zinc-200 bg-white px-3 py-2 font-mono text-[13px] outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60 dark:placeholder:text-zinc-500"></textarea>
+          <small class="text-[11px] text-zinc-400 dark:text-zinc-500">{lyrics} {song_name} {song_author} {timestamp} + _upper/_lower/_cropped/_letters_only variants · cropped to 128 chars</small>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <span class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300">Preview</span>
+        <div class="min-w-0 flex-1">
+          <div id="preview" class="whitespace-pre-wrap break-words rounded-lg border border-dashed border-zinc-300 bg-zinc-50 px-3.5 py-3 font-mono text-[13px] text-zinc-500 dark:border-zinc-700 dark:bg-zinc-950/60 dark:text-zinc-400"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mb-5 rounded-xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+    <h2 class="mb-2 font-mono text-[11px] font-medium uppercase tracking-[0.15em] text-zinc-400 dark:text-zinc-500">lyrics</h2>
+    <div class="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <span class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300">Providers</span>
+        <div class="flex min-w-0 flex-1 flex-col gap-2">
+          <label class="inline-flex items-center gap-2 text-[13px]"><input type="checkbox" id="provLrclib" value="lrclib" class="h-4 w-4 accent-violet-600"> LrcLib</label>
+          <label class="inline-flex items-center gap-2 text-[13px]"><input type="checkbox" id="provNetease" value="netease" class="h-4 w-4 accent-violet-600"> NetEase Music</label>
+          <label class="inline-flex items-center gap-2 text-[13px]"><input type="checkbox" id="provQqmusic" value="qqmusic" class="h-4 w-4 accent-violet-600"> QQ Music</label>
+          <label class="inline-flex items-center gap-2 text-[13px]"><input type="checkbox" id="provCustom" value="custom" class="h-4 w-4 accent-violet-600"> Custom</label>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="romanize">Romanize lyrics</label>
+        <div class="flex flex-1 items-center justify-end">
+          <label class="relative inline-flex cursor-pointer items-center">
+            <input type="checkbox" id="romanize" class="peer sr-only">
+            <div class="h-5 w-9 rounded-full bg-zinc-200 transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-4 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:bg-violet-600 peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-violet-500/40 dark:bg-zinc-700"></div>
+          </label>
+        </div>
+        <small class="w-full text-[11px] text-zinc-400 sm:pl-[156px] dark:text-zinc-500">Turns Japanese/Korean/Hindi/Bangla/Cyrillic/Greek/Arabic into Latin letters on the fly. Chinese passes through (needs a dictionary).</small>
+      </div>
+      <div id="customRow" class="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+        <div class="flex flex-wrap items-center gap-3 py-3.5">
+          <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="customName">Provider name</label>
+          <div class="flex min-w-0 flex-1 items-center justify-end">
+            <input type="text" id="customName" placeholder="e.g. MyProvider"
+                   class="h-9 w-full max-w-[280px] rounded-md border border-zinc-200 bg-white px-3 font-mono text-[13px] outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60 dark:placeholder:text-zinc-500">
+          </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-3 py-3.5">
+          <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="customUrl">URL template</label>
+          <div class="flex min-w-0 flex-1 items-center justify-end">
+            <input type="text" id="customUrl" placeholder="https://…/{title}?artist={artist}"
+                   class="h-9 w-full max-w-[280px] rounded-md border border-zinc-200 bg-white px-3 font-mono text-[13px] outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60 dark:placeholder:text-zinc-500">
+          </div>
+          <small class="w-full text-[11px] text-zinc-400 sm:pl-[156px] dark:text-zinc-500">{title} and {artist} are URL-quoted and substituted in. The response body is treated as LRC, unless a JSON path is given.</small>
+        </div>
+        <div class="flex flex-wrap items-center gap-3 py-3.5">
+          <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="customKey">API key</label>
+          <div class="flex min-w-0 flex-1 items-center justify-end">
+            <input type="password" id="customKey" autocomplete="off" placeholder="optional — {api_key} in URL or Bearer header"
+                   class="h-9 w-full max-w-[280px] rounded-md border border-zinc-200 bg-white px-3 font-mono text-[13px] outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60 dark:placeholder:text-zinc-500">
+          </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-3 py-3.5">
+          <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="customPath">JSON path</label>
+          <div class="flex min-w-0 flex-1 items-center justify-end">
+            <input type="text" id="customPath" placeholder="optional, e.g. /lrc/lyric"
+                   class="h-9 w-full max-w-[280px] rounded-md border border-zinc-200 bg-white px-3 font-mono text-[13px] outline-none transition placeholder:text-zinc-400 focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60 dark:placeholder:text-zinc-500">
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="mb-5 rounded-xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+    <h2 class="mb-2 font-mono text-[11px] font-medium uppercase tracking-[0.15em] text-zinc-400 dark:text-zinc-500">timing</h2>
+    <div class="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="offset">Send offset (ms)</label>
+        <div class="flex flex-1 items-center justify-end gap-2">
+          <input type="number" id="offset" min="0" max="10000" class="h-9 w-24 rounded-md border border-zinc-200 bg-white px-3 font-mono text-[13px] outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60">
+        </div>
+        <small class="w-full text-[11px] text-zinc-400 sm:pl-[156px] dark:text-zinc-500">How early the status changes relative to each lyric line.</small>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="autoOffset">Autooffset</label>
+        <div class="flex flex-1 items-center justify-end">
+          <label class="relative inline-flex cursor-pointer items-center">
+            <input type="checkbox" id="autoOffset" class="peer sr-only">
+            <div class="h-5 w-9 rounded-full bg-zinc-200 transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-4 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:bg-violet-600 peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-violet-500/40 dark:bg-zinc-700"></div>
+          </label>
+        </div>
+        <small class="w-full text-[11px] text-zinc-400 sm:pl-[156px] dark:text-zinc-500">Measure Discord API latency and adjust automatically (+100ms).</small>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="samples">Autooffset samples</label>
+        <div class="flex flex-1 items-center justify-end">
+          <input type="number" id="samples" min="1" max="20" class="h-9 w-24 rounded-md border border-zinc-200 bg-white px-3 font-mono text-[13px] outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20 dark:border-zinc-700 dark:bg-zinc-950/60">
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="rounded-xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+    <h2 class="mb-2 font-mono text-[11px] font-medium uppercase tracking-[0.15em] text-zinc-400 dark:text-zinc-500">system</h2>
+    <div class="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="autoStart">Auto-start on login</label>
+        <div class="flex flex-1 items-center justify-end">
+          <label class="relative inline-flex cursor-pointer items-center">
+            <input type="checkbox" id="autoStart" class="peer sr-only">
+            <div class="h-5 w-9 rounded-full bg-zinc-200 transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-4 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:bg-violet-600 peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-violet-500/40 dark:bg-zinc-700"></div>
+          </label>
+        </div>
+        <small class="w-full text-[11px] text-zinc-400 sm:pl-[156px] dark:text-zinc-500">Installs a platform autostart entry (Linux/macOS/Windows).</small>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 py-3.5">
+        <label class="w-36 shrink-0 text-[13px] font-medium text-zinc-600 dark:text-zinc-300" for="telemetry">Usage telemetry</label>
+        <div class="flex flex-1 items-center justify-end">
+          <label class="relative inline-flex cursor-pointer items-center">
+            <input type="checkbox" id="telemetry" class="peer sr-only">
+            <div class="h-5 w-9 rounded-full bg-zinc-200 transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-4 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:bg-violet-600 peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-violet-500/40 dark:bg-zinc-700"></div>
+          </label>
+        </div>
+        <small class="w-full text-[11px] text-zinc-400 sm:pl-[156px] dark:text-zinc-500">Reports an anonymous install id, OS, architecture and version once per run. No IPs or personal data — see mewsic.yasakei.dev/usage.</small>
+      </div>
+      <small class="block py-3.5 text-[11px] text-zinc-400 dark:text-zinc-500">Updates are checked when you launch mewsic or run <code>mewsic update</code> in a terminal.</small>
+    </div>
+  </section>
+</div>
+
+<div class="saved-flag" id="savedFlag">SAVED</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let settings = null;
+let saveTimer = null;
+
+function flashSaved() {
+  const f = $("savedFlag");
+  f.classList.add("show");
+  clearTimeout(flashSaved._t);
+  flashSaved._t = setTimeout(() => f.classList.remove("show"), 1400);
+}
+
+function setCheck(id, value) { $(id).checked = !!value; }
+function setVal(id, value) { $(id).value = value ?? ""; }
+
+function bindSettings() {
+  setCheck("timestamp", settings.view.timestamp);
+  setCheck("label", settings.view.label);
+  setCheck("autoClear", settings.view.auto_clear);
+  setVal("emoji", settings.view.emoji);
+  setCheck("advanced", settings.view.advanced.enabled);
+  setVal("advEmoji", settings.view.advanced.emoji);
+  setVal("advTemplate", settings.view.advanced.template);
+  setVal("offset", settings.timing.send_time_offset);
+  setCheck("autoOffset", settings.timing.enable_autooffset);
+  setVal("samples", settings.timing.autooffset);
+  setCheck("autoStart", settings.update.auto_start);
+  setCheck("telemetry", settings.usage ? settings.usage.enabled !== false : true);
+  $("token").value = "";
+  $("token").placeholder = settings.hasToken
+    ? "saved in your OS keychain — paste a new token to replace"
+    : "paste your Discord user token";
+  $("source").value = settings.source || "spotify";
+  setVal("lastfmKey", settings.lastfm ? settings.lastfm.api_key : "");
+  setVal("lastfmUser", settings.lastfm ? settings.lastfm.username : "");
+
+  const lyr = settings.lyrics || {};
+  const provs = lyr.providers || ["lrclib", "netease", "qqmusic"];
+  setCheck("provLrclib", provs.includes("lrclib"));
+  setCheck("provNetease", provs.includes("netease"));
+  setCheck("provQqmusic", provs.includes("qqmusic"));
+  setCheck("provCustom", provs.includes("custom"));
+  setCheck("romanize", !!lyr.romanize);
+  const custom = lyr.custom || {};
+  setVal("customName", custom.name);
+  setVal("customUrl", custom.url);
+  setVal("customKey", custom.api_key || "");
+  setVal("customPath", custom.json_path || "");
+
+  updateSourceVisibility();
+  updateAdvancedVisibility();
+  updateLyricsVisibility();
+  renderPreview();
+}
+
+function collectSettings() {
+  const s = {
+    source: $("source").value,
+    lastfm: {
+      api_key: $("lastfmKey").value.trim(),
+      username: $("lastfmUser").value.trim()
+    },
+    view: {
+      timestamp: $("timestamp").checked,
+      label: $("label").checked,
+      emoji: $("emoji").value,
+      auto_clear: $("autoClear").checked,
+      advanced: {
+        enabled: $("advanced").checked,
+        emoji: $("advEmoji").value,
+        template: $("advTemplate").value
+      }
+    },
+    timing: {
+      send_time_offset: +$("offset").value || 500,
+      enable_autooffset: $("autoOffset").checked,
+      autooffset: Math.max(1, +$("samples").value || 3)
+    },
+    update: { auto_start: $("autoStart").checked },
+    usage: { enabled: $("telemetry").checked },
+    lyrics: {
+      providers: collectLyricsProviders(),
+      romanize: $("romanize").checked,
+      custom: $("provCustom").checked ? {
+        name: $("customName").value.trim(),
+        url: $("customUrl").value.trim(),
+        api_key: $("customKey").value.trim() || null,
+        json_path: $("customPath").value.trim() || null
+      } : null
+    }
+  };
+  const token = $("token").value.replace(/"/g, "").trim();
+  if (token) s.token = token;
+  return s;
+}
+
+function collectLyricsProviders() {
+  const ids = [];
+  if ($("provLrclib").checked) ids.push("lrclib");
+  if ($("provNetease").checked) ids.push("netease");
+  if ($("provQqmusic").checked) ids.push("qqmusic");
+  if ($("provCustom").checked) ids.push("custom");
+  return ids;
+}
+
+function updateSourceVisibility() {
+  $("lastfmRow").style.display = $("source").value === "lastfm" ? "" : "none";
+}
+
+function updateAdvancedVisibility() {
+  const on = $("advanced").checked;
+  $("advRow").style.display = on ? "flex" : "none";
+  $("advTemplateRow").style.display = on ? "flex" : "none";
+}
+
+function updateLyricsVisibility() {
+  $("customRow").style.display = $("provCustom").checked ? "" : "none";
+}
+
+function fmtSeconds(s) {
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m + ":" + String(sec).padStart(2, "0");
+}
+
+function renderPreview() {
+  const v = collectSettings();
+  let parts = [];
+  if (v.view.timestamp) parts.push("[2:17]");
+  if (v.view.label) parts.push("Song lyrics -");
+  parts.push("La-la-la");
+  let text = parts.join(" ");
+  if (v.view.advanced.enabled) {
+    text = v.view.advanced.template
+      .replace(/\{lyrics\}/g, "La-la-la")
+      .replace(/\{song_name\}/g, "Example Song")
+      .replace(/\{song_author\}/g, "Example Artist")
+      .replace(/\{timestamp\}/g, "2:17")
+      .replace(/♪/g, "[music]");
+  }
+  const emoji = v.view.advanced.enabled ? v.view.advanced.emoji : v.view.emoji;
+  $("preview").textContent = (emoji ? emoji + " " : "") + text.slice(0, 128);
+}
+
+function queueSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveNow, 400);
+}
+
+async function saveNow() {
+  const body = collectSettings();
+  const res = await fetch("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (res.ok) { settings = body; flashSaved(); }
+}
+
+async function loadSettings() {
+  const res = await fetch("/api/settings");
+  settings = await res.json();
+  bindSettings();
+}
+
+async function pollState() {
+  try {
+    const res = await fetch("/api/state");
+    const s = await res.json();
+    $("npTitle").textContent = s.song || "NO TRACK";
+    $("npArtist").textContent = s.artist || "NO ARTIST";
+    const dur = s.duration || 0;
+    const prog = s.progress || 0;
+    const pct = dur ? Math.min(100, Math.round(prog / dur * 100)) : 0;
+    $("npBar").style.width = pct + "%";
+    $("npTime").textContent = fmtSeconds(Math.floor(prog / 1000)) + " / " + fmtSeconds(Math.floor(dur / 1000));
+    const line = typeof s.line === "string" ? s.line : (s.line && s.line.text);
+    $("npLine").textContent = line || (s.hasLyrics ? "WAITING FOR NEXT LINE" : "NO SYNCED LYRICS");
+    $("npSource").textContent = s.source || "NONE";
+    $("npPing").textContent = s.latency != null ? s.latency + " ms" : "NONE";
+    $("npAuto").textContent = s.autooffset != null ? s.autooffset + " ms" : "NONE";
+    $("dot").className = "dot " + (s.playing ? "on" : (s.song ? "off" : ""));
+    $("liveText").textContent = s.playing ? "playing" : (s.song ? "paused" : "idle");
+    const upd = s.update;
+    if (upd && upd.latest) {
+      $("updBanner").textContent = "update · v" + upd.latest + (upd.message ? " — " + upd.message : "");
+      $("updBanner").classList.remove("hidden");
+    } else {
+      $("updBanner").classList.add("hidden");
+    }
+  } catch (e) {
+    $("dot").className = "dot off";
+    $("liveText").textContent = "offline";
+  }
+}
+
+async function checkToken() {
+  const btn = $("checkToken");
+  const token = $("token").value.trim();
+  if (!token) return;
+  btn.disabled = true;
+  btn.textContent = "…";
+  try {
+    const res = await fetch("/api/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token })
+    });
+    const data = await res.json();
+    btn.className = data.ok ? "ok" : "err";
+    btn.textContent = data.ok ? "VALID" : "INVALID";
+    setTimeout(() => { btn.className = ""; btn.textContent = "check"; btn.disabled = false; }, 2200);
+  } catch (e) {
+    btn.className = "err"; btn.textContent = "error";
+    setTimeout(() => { btn.className = ""; btn.textContent = "check"; btn.disabled = false; }, 2200);
+  }
+}
+
+["timestamp","label","autoClear","advanced","autoOffset","autoStart","telemetry"].forEach(id => {
+  const el = $(id);
+  if (el) el.addEventListener("change", () => { if (id === "advanced") updateAdvancedVisibility(); queueSave(); renderPreview(); });
+});
+["emoji","advEmoji","offset","samples","token","lastfmKey","lastfmUser"].forEach(id => {
+  const el = $(id);
+  if (el) el.addEventListener("input", () => { queueSave(); renderPreview(); });
+});
+["provLrclib","provNetease","provQqmusic","provCustom","romanize"].forEach(id => {
+  const el = $(id);
+  if (el) el.addEventListener("change", () => { updateLyricsVisibility(); queueSave(); });
+});
+["customName","customUrl","customKey","customPath"].forEach(id => {
+  const el = $(id);
+  if (el) el.addEventListener("input", () => queueSave());
+});
+$("source").addEventListener("change", () => { updateSourceVisibility(); queueSave(); });
+$("advTemplate").addEventListener("input", () => { queueSave(); renderPreview(); });
+$("checkToken").addEventListener("click", checkToken);
+
+loadSettings();
+pollState();
+setInterval(pollState, 1000);
+</script>
+</body>
+</html>

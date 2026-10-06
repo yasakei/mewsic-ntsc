@@ -1,0 +1,135 @@
+use arrays
+use testing
+use "config.nt"
+use "romanize.nt"
+
+class StateLyricsLine {
+    var int time
+    var string text
+}
+
+class StatePlayback {
+    var string song_name
+    var string song_author
+    var string song_id
+    var string old_song_id
+    var int song_duration
+    var int song_progress
+    var array[int] lyric_times
+    var array[string] lyric_texts
+    var bool has_lyrics
+    var StateLyricsLine current_line
+    var bool has_current_line
+    var bool is_playing
+    fun init() {
+        this.lyric_times = arrays.fill(0, 0)
+        this.lyric_texts = arrays.fill("", 0)
+        this.current_line = StateLyricsLine()
+    }
+    fun ended() -> bool {
+        return this.song_duration > 0 && this.song_duration <= this.song_progress
+    }
+}
+
+class StateTracker {
+    var array[int] sent_lines
+    var string last_seen_song
+    var array[int] latencies
+    var int last_latency
+    var int lastfm_lag
+    var float last_send_ms
+    var bool prev_playing
+    fun init() {
+        this.sent_lines = arrays.fill(0, 0)
+        this.latencies = arrays.fill(0, 0)
+        this.lastfm_lag = -1
+        this.last_send_ms = -1.0
+    }
+    fun add_latency(int ms, int limit) {
+        arrays.push(this.latencies, ms)
+        var max = limit
+        if (max < 1) {
+            max = 1
+        }
+        while (arrays.length(this.latencies) > max) {
+            this.latencies = arrays.remove_at(this.latencies, 0)
+        }
+        this.last_latency = ms
+    }
+    fun avg_latency() -> int {
+        if (arrays.length(this.latencies) == 0) {
+            return 0
+        }
+        var sum = 0
+        var i = 0
+        while (i < arrays.length(this.latencies)) {
+            sum = sum + this.latencies[i]
+            i = i + 1
+        }
+        return sum / arrays.length(this.latencies)
+    }
+}
+
+class StateUpdateState {
+    var string latest
+    var string message
+}
+
+class StateShared {
+    var StatePlayback playback
+    var StateTracker tracker
+    var string lyric_source
+    var StateUpdateState update
+    fun init() {
+        this.playback = StatePlayback()
+        this.tracker = StateTracker()
+        this.lyric_source = "not fetched"
+        this.update = StateUpdateState()
+    }
+}
+
+class StateWeb {
+    var int listener
+    var bool running
+    fun init() {
+        this.listener = 0
+        this.running = false
+    }
+}
+
+class StateAppContext {
+    var StateShared state
+    var StateWeb web
+    var ConfigSettings settings
+    var string config_dir
+    var RomanizeTable table
+    var bool has_table
+    fun init() {
+        this.state = StateShared()
+        this.web = StateWeb()
+        this.settings = ConfigSettings()
+        this.config_dir = ""
+        this.table = RomanizeTable()
+        this.has_table = false
+    }
+}
+
+test state_playback_ended {
+    var pb = StatePlayback()
+    pb.song_duration = 300000
+    pb.song_progress = 1000
+    testing.assert_true(pb.ended() == false)
+    pb.song_progress = 300000
+    testing.assert_true(pb.ended() == true)
+}
+
+test state_tracker_latency_window {
+    var t = StateTracker()
+    testing.assert_true(t.avg_latency() == 0)
+    t.add_latency(100, 3)
+    t.add_latency(200, 3)
+    t.add_latency(300, 3)
+    t.add_latency(400, 3)
+    testing.assert_true(t.last_latency == 400)
+    testing.assert_true(t.avg_latency() == 300)
+}

@@ -1,0 +1,617 @@
+use sys
+use os
+use strings
+use json
+use toml
+use fmt
+use arrays
+use testing
+use "log.nt"
+use "util.nt"
+use "credential.nt"
+
+enum ConfigSource {
+    Spotify,
+    Lastfm
+}
+
+fun config_source_label(int s) -> string {
+    if (s == ConfigSource.Spotify) {
+        return "Spotify"
+    }
+    return "Last.fm"
+}
+
+fun config_source_id(int s) -> string {
+    if (s == ConfigSource.Spotify) {
+        return "spotify"
+    }
+    return "lastfm"
+}
+
+fun config_source_parse(string input) -> int {
+    var v = strings.lower(strings.trim(input))
+    if (v == "spotify" || v == "sp" || v == "discord" || v == "dc") {
+        return ConfigSource.Spotify
+    }
+    if (v == "lastfm" || v == "last.fm" || v == "lf" || v == "ytmusic" || v == "ytm") {
+        return ConfigSource.Lastfm
+    }
+    return -1
+}
+
+class ConfigLastFmSettings {
+    var string api_key
+    var string username
+}
+
+class ConfigCustomProvider {
+    var string name
+    var string url
+    var string api_key
+    var string json_path
+}
+
+class ConfigLyricsSettings {
+    var array[string] providers
+    var bool romanize
+    var ConfigCustomProvider custom
+    var bool has_custom
+    fun init() {
+        this.providers = ["lrclib", "netease", "qqmusic"]
+        this.romanize = false
+        this.custom = ConfigCustomProvider()
+        this.has_custom = false
+    }
+}
+
+fun config_builtin_provider_label(string id) -> string {
+    if (id == "lrclib") {
+        return "LrcLib"
+    }
+    if (id == "netease") {
+        return "NetEase Music"
+    }
+    if (id == "qqmusic") {
+        return "QQ Music"
+    }
+    if (id == "custom") {
+        return "Custom"
+    }
+    return "Unknown"
+}
+
+class ConfigAdvancedSettings {
+    var bool enabled
+    var string emoji
+    var string template
+    fun init() {
+        this.enabled = false
+        this.emoji = ""
+        this.template = "[{timestamp}] [{lyrics}]"
+    }
+}
+
+class ConfigViewSettings {
+    var bool timestamp
+    var bool label
+    var string emoji
+    var bool auto_clear
+    var ConfigAdvancedSettings advanced
+    fun init() {
+        this.timestamp = true
+        this.label = true
+        this.emoji = ""
+        this.auto_clear = true
+        this.advanced = ConfigAdvancedSettings()
+    }
+}
+
+class ConfigTimingSettings {
+    var int send_time_offset
+    var bool enable_autooffset
+    var int autooffset
+    fun init() {
+        this.send_time_offset = 500
+        this.enable_autooffset = true
+        this.autooffset = 3
+    }
+}
+
+class ConfigUpdateSettings {
+    var bool auto_start
+}
+
+class ConfigUsageSettings {
+    var bool enabled
+    fun init() {
+        this.enabled = true
+    }
+}
+
+class ConfigSettings {
+    var string token
+    var int source
+    var ConfigLastFmSettings lastfm
+    var ConfigViewSettings view_settings
+    var ConfigTimingSettings timing
+    var ConfigUpdateSettings update
+    var ConfigLyricsSettings lyrics
+    var ConfigUsageSettings usage
+    fun init() {
+        this.token = ""
+        this.source = ConfigSource.Spotify
+        this.lastfm = ConfigLastFmSettings()
+        this.view_settings = ConfigViewSettings()
+        this.timing = ConfigTimingSettings()
+        this.update = ConfigUpdateSettings()
+        this.lyrics = ConfigLyricsSettings()
+        this.usage = ConfigUsageSettings()
+    }
+}
+
+fun config_dir() -> string {
+    var override = os.getenv("MEWSIC_CONFIG_DIR")
+    if (override != "") {
+        return override
+    }
+    if (os.getenv("OS") == "Windows_NT") {
+        var appdata = os.getenv("APPDATA")
+        if (appdata != "") {
+            return appdata + "/mewsic"
+        }
+    } else {
+        var xdg = os.getenv("XDG_CONFIG_HOME")
+        if (xdg != "") {
+            return xdg + "/mewsic"
+        }
+        var home = os.getenv("HOME")
+        if (home != "") {
+            return home + "/.config/mewsic"
+        }
+    }
+    return "."
+}
+
+fun config_load(string dir) -> ConfigSettings {
+    var path = copy(dir) + "/settings.toml"
+    var s = config_default_with_migration(copy(dir))
+    if (sys.exists(path)) {
+        quiet [unused_variable] {
+            try {
+                var raw = sys.read(path)
+                var parsed = toml.parse(raw)
+                s = config_from_json(parsed)
+            } catch (e) {
+                config_back_up_broken(copy(dir), path)
+                s = config_default_with_migration(copy(dir))
+            }
+        }
+    }
+    var stored = credential_load_token(copy(dir))
+    if (stored != "") {
+        s.token = stored
+    } else {
+        if (s.token != "") {
+            var tok = copy(s.token)
+            var err = credential_store_token(copy(dir), tok)
+            if (err == "") {
+                s.token = ""
+                config_write_toml(copy(dir), s)
+            }
+        }
+    }
+    return s
+}
+
+fun config_save(view ConfigSettings s, string dir) -> string {
+    try {
+        sys.mkdir(dir)
+    } catch (e) {
+        return e
+    }
+    var file_settings = copy(s)
+    if (s.token == "") {
+        credential_clear_token(copy(dir))
+    } else {
+        var tok = copy(s.token)
+        var err = credential_store_token(copy(dir), tok)
+        if (err == "") {
+            file_settings.token = ""
+        } else {
+            log_write(copy(dir), "credential store unavailable; token stays in settings.toml (" + err + ")")
+        }
+    }
+    return config_write_toml(dir, file_settings)
+}
+
+fun config_write_toml(string dir, view ConfigSettings s) -> string {
+    var text = config_to_toml(s)
+    try {
+        sys.write(dir + "/settings.toml", text)
+    } catch (e) {
+        return e
+    }
+    sys.exec("chmod 600 '" + dir + "/settings.toml' 2>/dev/null")
+    return ""
+}
+
+fun config_default_with_migration(string dir) -> ConfigSettings {
+    var s = ConfigSettings()
+    if (config_try_migrate_legacy(s, dir + "/settings.json")) {
+        return s
+    }
+    if (config_try_migrate_legacy(s, "settings.json")) {
+        return s
+    }
+    return s
+}
+
+fun config_back_up_broken(string dir, string path) {
+    var backup = path + ".bak"
+    try {
+        sys.cp(path, backup)
+        log_write(dir, "settings.toml could not be parsed; keeping a copy at " + backup)
+    } catch (e) {
+        log_write(dir, "settings.toml could not be parsed; could not back it up: " + e)
+    }
+}
+
+fun config_try_migrate_legacy(view mut ConfigSettings s, string path) -> bool {
+    if (!sys.exists(path)) {
+        return false
+    }
+    var raw = ""
+    quiet [unused_variable] {
+        try {
+            raw = sys.read(path)
+        } catch (e) {
+            return false
+        }
+    }
+    var parsed = ""
+    quiet [unused_variable] {
+        try {
+            parsed = json.parse(raw)
+        } catch (e) {
+            return false
+        }
+    }
+    config_fill_legacy_json(s, parsed)
+    quiet [unused_variable] {
+        try {
+            sys.rm(path)
+        } catch (e) {
+        }
+    }
+    return true
+}
+
+fun config_unquote(string v, string key) -> string {
+    var q = util_dquote()
+    if (strings.length(v) >= 2 && strings.starts_with(v, q) && strings.ends_with(v, q)) {
+        return strings.substring(v, 1, strings.length(v) - 1)
+    }
+    throw "expected string for key: " + key
+}
+
+fun config_get_str(string obj, string key) -> string {
+    var v = json.get(obj, key)
+    if (v == "null") {
+        return ""
+    }
+    return config_unquote(v, key)
+}
+
+fun config_get_bool(string obj, string key, bool dflt) -> bool {
+    var v = json.get(obj, key)
+    if (v == "null") {
+        return dflt
+    }
+    if (v == "true") {
+        return true
+    }
+    if (v == "false") {
+        return false
+    }
+    throw "expected bool for key: " + key
+}
+
+fun config_get_int(string obj, string key, int dflt) -> int {
+    var v = json.get(obj, key)
+    if (v == "null") {
+        return dflt
+    }
+    return fmt.to_int(v)
+}
+
+fun config_get_obj(string obj, string key) -> string {
+    var v = json.get(obj, key)
+    if (v == "null") {
+        return ""
+    }
+    if (!strings.starts_with(v, "{")) {
+        throw "expected object for key: " + key
+    }
+    return v
+}
+
+fun config_from_json(string obj) -> ConfigSettings {
+    var s = ConfigSettings()
+    s.token = config_get_str(copy(obj), "token")
+    var src = json.get(copy(obj), "source")
+    if (src != "null") {
+        var id = config_unquote(src, "source")
+        if (id == "spotify") {
+            s.source = ConfigSource.Spotify
+        } else {
+            if (id == "lastfm") {
+                s.source = ConfigSource.Lastfm
+            } else {
+                throw "unknown source: " + id
+            }
+        }
+    }
+    var lastfm = config_get_obj(copy(obj), "lastfm")
+    if (lastfm != "") {
+        s.lastfm.api_key = config_get_str(copy(lastfm), "api_key")
+        s.lastfm.username = config_get_str(lastfm, "username")
+    }
+    var view_obj = config_get_obj(copy(obj), "view")
+    if (view_obj!= "") {
+        s.view_settings.timestamp = config_get_bool(copy(view_obj), "timestamp", true)
+        s.view_settings.label = config_get_bool(copy(view_obj), "label", true)
+        s.view_settings.emoji = config_get_str(copy(view_obj), "emoji")
+        s.view_settings.auto_clear = config_get_bool(copy(view_obj), "auto_clear", true)
+        var adv = config_get_obj(copy(view_obj), "advanced")
+        if (adv != "") {
+            s.view_settings.advanced.enabled = config_get_bool(copy(adv), "enabled", false)
+            s.view_settings.advanced.emoji = config_get_str(copy(adv), "emoji")
+            s.view_settings.advanced.template = config_get_str(adv, "template")
+        }
+    }
+    var timing = config_get_obj(copy(obj), "timing")
+    if (timing != "") {
+        s.timing.send_time_offset = config_get_int(copy(timing), "send_time_offset", 500)
+        s.timing.enable_autooffset = config_get_bool(copy(timing), "enable_autooffset", true)
+        s.timing.autooffset = config_get_int(timing, "autooffset", 3)
+    }
+    var update = config_get_obj(copy(obj), "update")
+    if (update != "") {
+        s.update.auto_start = config_get_bool(update, "auto_start", false)
+    }
+    var lyrics = config_get_obj(copy(obj), "lyrics")
+    if (lyrics != "") {
+        var pv = json.get(copy(lyrics), "providers")
+        if (pv != "null") {
+            s.lyrics.providers = config_parse_string_array(pv)
+        }
+        s.lyrics.romanize = config_get_bool(copy(lyrics), "romanize", false)
+        var custom = config_get_obj(copy(lyrics), "custom")
+        if (custom != "") {
+            s.lyrics.has_custom = true
+            s.lyrics.custom.name = config_get_str(copy(custom), "name")
+            s.lyrics.custom.url = config_get_str(copy(custom), "url")
+            s.lyrics.custom.api_key = config_get_str(copy(custom), "api_key")
+            s.lyrics.custom.json_path = config_get_str(custom, "json_path")
+        }
+    }
+    var usage = config_get_obj(copy(obj), "usage")
+    if (usage != "") {
+        s.usage.enabled = config_get_bool(usage, "enabled", true)
+    }
+    return s
+}
+
+fun config_parse_string_array(view string text) -> array[string] {
+    var t = strings.trim(text)
+    if (!strings.starts_with(t, "[") || !strings.ends_with(t, "]")) {
+        throw "expected string array"
+    }
+    var array[string] out = arrays.fill("", 0)
+    var inner = strings.substring(t, 1, strings.length(t) - 1)
+    var i = 0
+    var len = strings.length(inner)
+    var nl = strings.from_char_code(10)
+    var cr = strings.from_char_code(13)
+    var tab = strings.from_char_code(9)
+    while (i < len) {
+        var c = strings.char_at(inner, i)
+        if (c == " " || c == "," || c == nl || c == cr || c == tab) {
+            i = i + 1
+            continue
+        }
+        if (c != util_dquote()) {
+            throw "expected string in array"
+        }
+        i = i + 1
+        var item = ""
+        var bs = strings.from_char_code(92)
+        while (i < len && strings.char_at(inner, i) != util_dquote()) {
+            var d = strings.char_at(inner, i)
+            if (d == bs) {
+                i = i + 1
+                if (i >= len) {
+                    throw "bad escape in array"
+                }
+                var e = strings.char_at(inner, i)
+                if (e == "n") {
+                    item = item + nl
+                } else {
+                    if (e == "r") {
+                        item = item + cr
+                    } else {
+                        if (e == "t") {
+                            item = item + tab
+                        } else {
+                            item = item + e
+                        }
+                    }
+                }
+            } else {
+                item = item + d
+            }
+            i = i + 1
+        }
+        if (i >= len) {
+            throw "unterminated string in array"
+        }
+        i = i + 1
+        arrays.push(out, item)
+    }
+    return out
+}
+
+fun config_toml_bool(bool b) -> string {
+    if (b) {
+        return "true"
+    }
+    return "false"
+}
+
+fun config_to_toml(view ConfigSettings s) -> string {
+    var nl = strings.from_char_code(10)
+    var out = ""
+    if (s.token != "") {
+        out = out + "token = " + json.escape_string(s.token) + nl
+    }
+    out = out + "source = " + json.escape_string(config_source_id(s.source)) + nl
+    out = out + "[lastfm]" + nl
+    out = out + "api_key = " + json.escape_string(s.lastfm.api_key) + nl
+    out = out + "username = " + json.escape_string(s.lastfm.username) + nl
+    out = out + "[view]" + nl
+    out = out + "timestamp = " + config_toml_bool(s.view_settings.timestamp) + nl
+    out = out + "label = " + config_toml_bool(s.view_settings.label) + nl
+    out = out + "emoji = " + json.escape_string(s.view_settings.emoji) + nl
+    out = out + "auto_clear = " + config_toml_bool(s.view_settings.auto_clear) + nl
+    out = out + "[view.advanced]" + nl
+    out = out + "enabled = " + config_toml_bool(s.view_settings.advanced.enabled) + nl
+    out = out + "emoji = " + json.escape_string(s.view_settings.advanced.emoji) + nl
+    out = out + "template = " + json.escape_string(s.view_settings.advanced.template) + nl
+    out = out + "[timing]" + nl
+    out = out + "send_time_offset = " + s.timing.send_time_offset + nl
+    out = out + "enable_autooffset = " + config_toml_bool(s.timing.enable_autooffset) + nl
+    out = out + "autooffset = " + s.timing.autooffset + nl
+    out = out + "[update]" + nl
+    out = out + "auto_start = " + config_toml_bool(s.update.auto_start) + nl
+    out = out + "[lyrics]" + nl
+    var parts = ""
+    var i = 0
+    while (i < arrays.length(s.lyrics.providers)) {
+        if (i > 0) {
+            parts = parts + ", "
+        }
+        parts = parts + json.escape_string(s.lyrics.providers[i])
+        i = i + 1
+    }
+    out = out + "providers = [" + parts + "]" + nl
+    out = out + "romanize = " + config_toml_bool(s.lyrics.romanize) + nl
+    if (s.lyrics.has_custom) {
+        out = out + "[lyrics.custom]" + nl
+        out = out + "name = " + json.escape_string(s.lyrics.custom.name) + nl
+        out = out + "url = " + json.escape_string(s.lyrics.custom.url) + nl
+        if (s.lyrics.custom.api_key != "") {
+            out = out + "api_key = " + json.escape_string(s.lyrics.custom.api_key) + nl
+        }
+        if (s.lyrics.custom.json_path != "") {
+            out = out + "json_path = " + json.escape_string(s.lyrics.custom.json_path) + nl
+        }
+    }
+    out = out + "[usage]" + nl
+    out = out + "enabled = " + config_toml_bool(s.usage.enabled) + nl
+    return out
+}
+
+fun config_fill_legacy_json(view mut ConfigSettings s, string obj) {
+    var view_obj = json.get(obj, "view")
+    if (view_obj!= "null" && strings.starts_with(view_obj, "{")) {
+        s.view_settings.timestamp = config_get_bool(copy(view_obj), "timestamp", true)
+        s.view_settings.label = config_get_bool(copy(view_obj), "label", true)
+        s.view_settings.auto_clear = config_get_bool(view_obj, "autoClear", true)
+        s.view_settings.emoji = config_opt_legacy_str(view_obj, "emoji")
+        var adv = json.get(view_obj, "advanced")
+        if (adv != "null" && strings.starts_with(adv, "{")) {
+            s.view_settings.advanced.enabled = config_get_bool(copy(adv), "enabled", false)
+            s.view_settings.advanced.emoji = config_opt_legacy_str(adv, "customEmoji")
+            s.view_settings.advanced.template = config_opt_legacy_str(adv, "customStatus")
+            if (s.view_settings.advanced.template == "") {
+                s.view_settings.advanced.template = "[{timestamp}] [{lyrics}]"
+            }
+        }
+    }
+    var tim = json.get(obj, "timings")
+    if (tim != "null" && strings.starts_with(tim, "{")) {
+        s.timing.send_time_offset = config_get_int(tim, "sendTimeOffset", 500)
+        s.timing.enable_autooffset = config_get_bool(tim, "enableAutooffset", true)
+        s.timing.autooffset = config_get_int(tim, "autooffset", 3)
+    }
+    var upd = json.get(obj, "update")
+    if (upd != "null" && strings.starts_with(upd, "{")) {
+        s.update.auto_start = config_get_bool(upd, "autoStart", false)
+    }
+    var token = json.get(obj, "credentials")
+    if (token != "null" && strings.starts_with(token, "{")) {
+        s.token = config_opt_legacy_str(token, "token")
+    }
+}
+
+fun config_opt_legacy_str(string obj, string key) -> string {
+    var v = json.get(obj, key)
+    if (v == "null") {
+        return ""
+    }
+    var q = util_dquote()
+    if (strings.length(v) >= 2 && strings.starts_with(v, q) && strings.ends_with(v, q)) {
+        return strings.substring(v, 1, strings.length(v) - 1)
+    }
+    return ""
+}
+
+test config_source_defaults_to_spotify {
+    var s = ConfigSettings()
+    testing.assert_true(s.source == ConfigSource.Spotify)
+}
+
+test config_source_parse_aliases {
+    testing.assert_true(config_source_parse("spotify") == ConfigSource.Spotify)
+    testing.assert_true(config_source_parse("SP") == ConfigSource.Spotify)
+    testing.assert_true(config_source_parse("lastfm") == ConfigSource.Lastfm)
+    testing.assert_true(config_source_parse("last.fm") == ConfigSource.Lastfm)
+    testing.assert_true(config_source_parse("ytmusic") == ConfigSource.Lastfm)
+    testing.assert_true(config_source_parse("ytm") == ConfigSource.Lastfm)
+    testing.assert_true(config_source_parse("slack") == -1)
+}
+
+test config_lyrics_defaults_to_all_builtins {
+    var s = ConfigSettings()
+    testing.assert_true(arrays.length(s.lyrics.providers) == 3)
+    testing.assert_true(s.lyrics.providers[0] == "lrclib")
+    testing.assert_true(s.lyrics.has_custom == false)
+}
+
+test config_toml_roundtrip_keeps_custom_provider {
+    var dir = "/tmp/mewsic-cfg-test"
+    sys.mkdir(dir)
+    var s = ConfigSettings()
+    s.source = ConfigSource.Lastfm
+    s.lastfm.api_key = "abc"
+    s.lastfm.username = "someone"
+    s.lyrics.providers = ["lrclib", "custom"]
+    s.lyrics.has_custom = true
+    s.lyrics.custom.name = "Provider"
+    s.lyrics.custom.url = "https://example.com/{title}/{artist}"
+    s.lyrics.custom.api_key = "sekrit"
+    s.lyrics.custom.json_path = "/lrc/lyric"
+    var err = config_write_toml(copy(dir), s)
+    testing.assert_true(err == "")
+    var raw = sys.read(copy(dir) + "/settings.toml")
+    testing.assert_true(strings.contains(raw, "source = " + util_dquote() + "lastfm" + util_dquote()))
+    var back = config_from_json(toml.parse(raw))
+    testing.assert_true(back.source == ConfigSource.Lastfm)
+    testing.assert_true(back.lastfm.username == "someone")
+    testing.assert_true(back.lyrics.has_custom == true)
+    testing.assert_true(back.lyrics.custom.name == "Provider")
+    testing.assert_true(back.lyrics.custom.api_key == "sekrit")
+    testing.assert_true(back.lyrics.custom.json_path == "/lrc/lyric")
+    sys.rm(copy(dir) + "/settings.toml")
+}

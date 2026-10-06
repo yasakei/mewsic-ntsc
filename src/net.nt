@@ -1,0 +1,5 @@
+use "util.nt"
+
+fun net_user_agent() -> string {
+    return "mewsic/" + mewsic_version
+}

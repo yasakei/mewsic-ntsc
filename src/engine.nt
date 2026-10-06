@@ -1,0 +1,1098 @@
+use strings
+use arrays
+use json
+use time
+use sys
+use fmt
+use testing
+use "log.nt"
+use "util.nt"
+use "net.nt"
+use "state.nt"
+use "config.nt"
+use "sync.nt"
+use "lyrics.nt"
+use "connector.nt"
+use "lastfm.nt"
+use "romanize.nt"
+
+static const var int engine_default_lastfm_lag_ms = 3000
+
+static const var int engine_keepalive_interval_ms = 45000
+
+class EngineAction {
+    var string kind
+    var string text
+    var string emoji
+    fun init() {
+        this.kind = "none"
+        this.text = ""
+        this.emoji = ""
+    }
+}
+class UiSnapshot {
+    var string song_name
+    var string song_author
+    var int song_progress
+    var int song_duration
+    var bool is_playing
+    var bool has_lyrics
+    var string current_line
+    fun init() {
+        this.song_name = ""
+        this.song_author = ""
+        this.song_progress = 0
+        this.song_duration = 0
+        this.is_playing = false
+        this.has_lyrics = false
+        this.current_line = ""
+    }
+}
+
+
+fun engine_snapshot(view StateAppContext ctx) -> UiSnapshot {
+    var snapshot = UiSnapshot()
+    snapshot.song_name = copy(ctx.state.playback.song_name)
+    snapshot.song_author = copy(ctx.state.playback.song_author)
+    snapshot.song_progress = ctx.state.playback.song_progress
+    snapshot.song_duration = ctx.state.playback.song_duration
+    snapshot.is_playing = ctx.state.playback.is_playing
+    snapshot.has_lyrics = ctx.state.playback.has_lyrics
+    if (ctx.state.playback.has_current_line) {
+        if (ctx.settings.lyrics.romanize) {
+            var table = engine_table(copy(ctx.config_dir))
+            snapshot.current_line = romanize_romanize(copy(ctx.state.playback.current_line.text), table)
+        } else {
+            snapshot.current_line = copy(ctx.state.playback.current_line.text)
+        }
+    }
+    return snapshot
+}
+
+fun engine_last_source(view StateAppContext ctx) -> string {
+    return copy(ctx.state.lyric_source)
+}
+
+fun engine_last_latency(view StateAppContext ctx) -> int {
+    return ctx.state.tracker.last_latency
+}
+
+fun engine_table(view string config_dir) -> RomanizeTable {
+    var fetcher = lyrics_fetcher_new(copy(config_dir))
+    return lyrics_table(fetcher)
+}
+
+
+fun engine_tick(view mut StateAppContext ctx, int delta_ms, view mut EngineAction action) {
+    var pb = ctx.state.playback
+    if (pb.is_playing) {
+        pb.song_progress = pb.song_progress + delta_ms
+    }
+    if (pb.ended()) {
+        ctx.state.tracker.sent_lines = arrays.fill(0, 0)
+    }
+    if (engine_playing_edge_to_pause(ctx.state.tracker, pb.is_playing)) {
+        engine_action_set(action, "restore", "", "")
+        return
+    }
+    var sent = engine_maybe_send_line(ctx)
+    if (sent.kind != "none") {
+        engine_action_set(action, sent.kind, sent.text, sent.emoji)
+        return
+    }
+    var keep_alive = engine_maybe_keep_alive(ctx)
+    engine_action_set(action, keep_alive.kind, keep_alive.text, keep_alive.emoji)
+}
+
+fun engine_action_set(view mut EngineAction action, view string kind, view string text, view string emoji) {
+    action.kind = copy(kind)
+    action.text = copy(text)
+    action.emoji = copy(emoji)
+}
+
+fun engine_action(string kind, string text, string emoji) -> EngineAction {
+    var action = EngineAction()
+    engine_action_set(action, kind, text, emoji)
+    return action
+}
+
+fun engine_playing_edge_to_pause(view mut StateTracker tracker, bool playing) -> bool {
+    var edge = tracker.prev_playing && !playing
+    tracker.prev_playing = playing
+    return edge
+}
+
+fun engine_offset(view ConfigSettings settings, view StateTracker tracker) -> int {
+    var allowance = settings.timing.send_time_offset
+    if (settings.timing.enable_autooffset) {
+        allowance = tracker.avg_latency() + 100
+    }
+    if (settings.source == ConfigSource.Lastfm) {
+        var lag = tracker.lastfm_lag
+        if (lag < 0) {
+            lag = engine_default_lastfm_lag_ms
+        }
+        return lag + allowance
+    }
+    return allowance
+}
+
+fun engine_pick_line(view array[int] times, view array[string] texts, int threshold, view StateTracker tracker, view StatePlayback pb) -> int {
+    var i = 0
+    while (i < arrays.length(times)) {
+        if (times[i] >= threshold) {
+            i = i + 1
+            continue
+        }
+        if (strings.trim(copy(texts[i])) == "") {
+            i = i + 1
+            continue
+        }
+        if (i + 1 < arrays.length(times) && times[i + 1] < threshold) {
+            i = i + 1
+            continue
+        }
+        if (engine_sent_line_contains(tracker, times[i])) {
+            i = i + 1
+            continue
+        }
+        if (pb.has_current_line && pb.current_line.time == times[i]) {
+            i = i + 1
+            continue
+        }
+        return i
+    }
+    return -1
+}
+
+fun engine_sent_line_contains(view StateTracker tracker, int time) -> bool {
+    var i = 0
+    while (i < arrays.length(tracker.sent_lines)) {
+        if (tracker.sent_lines[i] == time) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fun engine_maybe_send_line(view mut StateAppContext ctx) -> EngineAction {
+    var pb = ctx.state.playback
+    var tracker = ctx.state.tracker
+    if (pb.song_id != "" && pb.song_id != tracker.last_seen_song) {
+        tracker.last_seen_song = copy(pb.song_id)
+        tracker.sent_lines = arrays.fill(0, 0)
+        if (ctx.settings.view_settings.auto_clear) {
+            return engine_action("clear", "", "")
+        }
+    }
+    if (!pb.is_playing || !pb.has_lyrics || pb.ended()) {
+        return engine_action("none", "", "")
+    }
+    var threshold = pb.song_progress + engine_offset(ctx.settings, tracker)
+    var index = engine_pick_line(pb.lyric_times, pb.lyric_texts, threshold, tracker, pb)
+    if (index == -1) {
+        return engine_action("none", "", "")
+    }
+    var line = StateLyricsLine()
+    line.time = pb.lyric_times[index]
+    line.text = copy(pb.lyric_texts[index])
+    pb.current_line = line
+    pb.has_current_line = true
+    arrays.push(tracker.sent_lines, line.time)
+    tracker.last_send_ms = time.now() / 1000.0
+
+    var settings = ctx.settings
+    var (text, emoji) = sync_build_status(settings, pb, line, engine_table(copy(ctx.config_dir)))
+    return engine_action("update", text, emoji)
+}
+
+fun engine_maybe_keep_alive(view mut StateAppContext ctx) -> EngineAction {
+    var tracker = ctx.state.tracker
+    if (tracker.last_send_ms < 0.0) {
+        return engine_action("none", "", "")
+    }
+    var elapsed_ms = util_trunc(time.now() / 1000.0 - tracker.last_send_ms) * 1000
+    if (elapsed_ms < engine_keepalive_interval_ms) {
+        return engine_action("none", "", "")
+    }
+    var pb = ctx.state.playback
+    if (!pb.is_playing || !pb.has_lyrics || pb.ended()) {
+        return engine_action("none", "", "")
+    }
+    if (!pb.has_current_line) {
+        return engine_action("none", "", "")
+    }
+    var settings = ctx.settings
+    var (text, emoji) = sync_build_status(settings, pb, pb.current_line, engine_table(copy(ctx.config_dir)))
+    tracker.last_send_ms = time.now() / 1000.0
+    return engine_action("keepalive", text, emoji)
+}
+
+
+fun engine_apply_state(view mut StateAppContext ctx, view PlayerState state, bool has_progress, int progress_ms) -> bool {
+    var pb = ctx.state.playback
+    if (state.track_id == "") {
+        if (has_progress) {
+            pb.song_progress = progress_ms
+        }
+        pb.is_playing = state.is_playing
+        return false
+    }
+    var song_changed = pb.song_id != state.track_id
+    pb.is_playing = state.is_playing
+    pb.song_duration = state.duration_ms
+    if (has_progress) {
+        pb.song_progress = progress_ms
+    }
+    if (song_changed) {
+        pb.old_song_id = copy(pb.song_id)
+        pb.song_id = copy(state.track_id)
+        pb.song_name = connector_cleanup_title(copy(state.name))
+        pb.song_author = copy(state.artist)
+    }
+    if (!song_changed) {
+        var fixed_name = connector_cleanup_title(copy(state.name))
+        if (fixed_name != "" && (pb.song_name == "" || pb.song_name != fixed_name)) {
+            pb.song_name = copy(fixed_name)
+        }
+        if (state.artist != "" && pb.song_author != copy(state.artist)) {
+            pb.song_author = copy(state.artist)
+        }
+        if (!has_progress) {
+            pb.song_progress = 0
+        }
+    }
+    return song_changed
+}
+
+fun engine_sync_lyrics(view mut LyricsFetcher fetcher, view ConfigLyricsSettings lyrics, view string name, string artist) -> string {
+    var romanize_changed = fetcher.romanize_changed(lyrics)
+    if (fetcher.last_fetched_for == copy(name) + copy(artist) && !romanize_changed && !fetcher.providers_changed(lyrics)) {
+        return engine_lyrics_message(copy(name), copy(artist), false, "", "[]")
+    }
+    var cached = lyrics_read_cache(fetcher, copy(name), copy(artist), lyrics.romanize)
+    if (arrays.length(cached) > 0) {
+        var msg = engine_lyrics_message(copy(name), copy(artist), true, "cache", lyrics_lines_to_json(cached))
+        return msg
+    }
+    var (lines, source) = lyrics_fetch(fetcher, copy(name), copy(artist), lyrics)
+    if (arrays.length(lines) == 0) {
+        return engine_lyrics_message(copy(name), copy(artist), false, "none", "[]")
+    }
+    return engine_lyrics_message(copy(name), copy(artist), true, copy(source), lyrics_lines_to_json(lines))
+}
+
+
+fun engine_test_ctx() -> StateAppContext {
+    return StateAppContext()
+}
+
+
+
+fun engine_fill_playback(view StatePlayback pb, int progress) {
+    pb.song_id = "id"
+    pb.song_name = "Song"
+    pb.song_author = "Artist"
+    pb.has_lyrics = true
+    pb.is_playing = true
+    pb.song_progress = progress
+    pb.song_duration = 300000
+    pb.lyric_times = arrays.fill(0, 0)
+    pb.lyric_texts = arrays.fill("", 0)
+    arrays.push(pb.lyric_times, 1500)
+    arrays.push(pb.lyric_texts, "hello")
+}
+
+
+
+
+
+
+
+
+
+
+
+
+class EngineStatusState {
+    var string token
+    var string original
+    var bool has_original
+    var int latency_limit
+    fun init() {
+        this.token = ""
+        this.original = ""
+        this.has_original = false
+        this.latency_limit = 1
+    }
+}
+
+fun engine_push_status(view mut EngineStatusState state, view string message) -> string {
+    var string kind = util_json_string(json.get(copy(message), "kind"))
+    if (state.token == "") {
+        return ""
+    }
+    if (!state.has_original && (kind == "update" || kind == "keepalive" || kind == "clear")) {
+        var (err, status) = connector_fetch_status(copy(state.token))
+        if (err.unauthorized || err.message != "") {
+            log_write("", "could not capture Discord status: " + copy(err.message))
+            return ""
+        }
+        state.original = copy(status)
+        state.has_original = true
+    }
+    var string text = util_json_string(json.get(copy(message), "text"))
+    var string emoji = util_json_string(json.get(copy(message), "emoji"))
+    var int started = util_trunc(time.now())
+    var err = connector_patch_status(copy(state.token), copy(text), copy(emoji))
+    if (kind != "update" || err.unauthorized || err.message != "") {
+        return ""
+    }
+    var string q = util_dquote()
+    return "{" + q + "kind" + q + ":" + q + "latency" + q + "," + q + "ms" + q + ":" + fmt.i64_to_str(util_trunc(time.now()) - started) + "}"
+}
+
+fun engine_restore_status(view mut EngineStatusState state) {
+    if (!state.has_original || state.token == "") {
+        return
+    }
+    var string body = "{" + util_dquote() + "custom_status" + util_dquote() + ":" + copy(state.original) + "}"
+    connector_patch_settings(copy(state.token), body)
+}
+
+class EnginePoller {
+    var string config_dir
+    var int source_setting
+    var string discord_token
+    var string api_key
+    var string username
+    var LyricsFetcher fetcher
+    var string spotify_token
+    var int token_retry_after
+    var string last_track
+    var string last_lyrics_key
+    var int last_lyrics_at
+    var int player_retry_after
+    var string warned_source
+    fun init() {
+        this.config_dir = ""
+        this.source_setting = ConfigSource.Spotify
+        this.discord_token = ""
+        this.api_key = ""
+        this.username = ""
+        this.fetcher = lyrics_fetcher_new("")
+        this.spotify_token = ""
+        this.token_retry_after = 0
+        this.last_track = ""
+        this.last_lyrics_key = ""
+        this.last_lyrics_at = 0
+        this.player_retry_after = 0
+        this.warned_source = ""
+    }
+}
+
+fun engine_poll_once(view mut EnginePoller poller) -> array[string] {
+    var array[string] out = arrays.fill("", 0)
+    if (poller.source_setting == ConfigSource.Spotify) {
+        if (poller.discord_token == "") {
+            return out
+        }
+        if (poller.spotify_token == "") {
+            if (poller.token_retry_after > engine_now_unix_secs()) {
+                return out
+            }
+            var (err, token) = connector_fetch_spotify_token(copy(poller.discord_token))
+            if (err.unauthorized || err.message != "") {
+                poller.token_retry_after = engine_now_unix_secs() + engine_token_backoff_secs(poller)
+                arrays.push(out, engine_log_message("spotify token refresh failed: " + copy(err.message)))
+                return out
+            }
+            poller.spotify_token = copy(token)
+        }
+        if (poller.player_retry_after > engine_now_unix_secs()) {
+            return out
+        }
+        var int started = util_trunc(time.now())
+        var (perr, pstate, playing) = connector_fetch_player(copy(poller.spotify_token))
+        if (perr.unauthorized) {
+            poller.spotify_token = ""
+            poller.token_retry_after = engine_now_unix_secs() + engine_token_backoff_secs(poller)
+            arrays.push(out, engine_log_message("spotify player returned 401, refreshing token"))
+            return out
+        }
+        if (perr.timed_out) {
+            return out
+        }
+        if (perr.message != "") {
+            poller.player_retry_after = engine_now_unix_secs() + 10
+            arrays.push(out, engine_log_message("spotify player error: " + copy(perr.message)))
+            return out
+        }
+        if (!playing) {
+            poller.last_track = ""
+            arrays.push(out, engine_state_message("stopped", "", "", "", 0, false, 0))
+            return out
+        }
+        var int progress = pstate.progress_ms + (time.now() - started)
+        arrays.push(out, engine_state_message("state", copy(pstate.track_id), copy(pstate.name), copy(pstate.artist), progress, true, pstate.duration_ms))
+        if (poller.last_track != copy(pstate.track_id)) {
+            poller.last_track = copy(pstate.track_id)
+        }
+        if (engine_lyrics_wanted(poller, copy(pstate.name), copy(pstate.artist))) {
+            arrays.push(out, engine_lyrics_request(copy(pstate.name), copy(pstate.artist)))
+        }
+        return out
+    }
+    if (poller.api_key == "" || poller.username == "") {
+        if (poller.warned_source != "lastfm") {
+            poller.warned_source = "lastfm"
+            arrays.push(out, engine_log_message("last.fm source selected but no api key/username set"))
+        }
+        poller.last_track = ""
+        arrays.push(out, engine_state_message("stopped", "", "", "", 0, false, 0))
+        return out
+    }
+    poller.warned_source = ""
+    if (poller.player_retry_after > engine_now_unix_secs()) {
+        return out
+    }
+    var (lerr, lstate, playing, prev_uts) = lastfm_fetch_player(copy(poller.api_key), copy(poller.username))
+    if (lerr.timed_out) {
+        return out
+    }
+    if (lerr.unauthorized || lerr.message != "") {
+        poller.player_retry_after = engine_now_unix_secs() + 10
+        arrays.push(out, engine_log_message("last.fm player error: " + copy(lerr.message)))
+        return out
+    }
+    if (!playing) {
+        poller.last_track = ""
+        arrays.push(out, engine_state_message("stopped", "", "", "", 0, false, 0))
+        return out
+    }
+    if (poller.last_track != copy(lstate.track_id)) {
+        poller.last_track = copy(lstate.track_id)
+        var int lag = lastfm_measure_lag(engine_now_unix_secs(), prev_uts)
+        if (lag >= 0) {
+            arrays.push(out, engine_lag_message(lag))
+        }
+    }
+    if (engine_lyrics_wanted(poller, copy(lstate.name), copy(lstate.artist))) {
+        arrays.push(out, engine_lyrics_request(copy(lstate.name), copy(lstate.artist)))
+    }
+    arrays.push(out, engine_state_message("state", copy(lstate.track_id), copy(lstate.name), copy(lstate.artist), 0, false, lstate.duration_ms))
+    return out
+}
+
+fun engine_answer_lyrics_request(view mut EnginePoller poller, view string request) -> string {
+    var string name = util_json_string(json.get(copy(request), "name"))
+    var string artist = util_json_string(json.get(copy(request), "artist"))
+    var ConfigLyricsSettings lyrics = ConfigLyricsSettings()
+    return engine_sync_lyrics(poller.fetcher, lyrics, copy(name), copy(artist))
+}
+
+static const var int engine_lyrics_retry_secs = 300
+
+fun engine_lyrics_wanted(view mut EnginePoller poller, string name, string artist) -> bool {
+    var key = copy(name) + "\u{1}" + copy(artist)
+    var int now = engine_now_unix_secs()
+    if (key == poller.last_lyrics_key && now - poller.last_lyrics_at < engine_lyrics_retry_secs) {
+        return false
+    }
+    poller.last_lyrics_key = copy(key)
+    poller.last_lyrics_at = now
+    return true
+}
+
+fun engine_token_backoff_secs(view mut EnginePoller poller) -> int {
+    if (poller.token_retry_after > 0) {
+        return 60
+    }
+    return 15
+}
+
+fun engine_now_unix_secs() -> int {
+    return util_trunc(time.now() / 1000.0)
+}
+
+fun engine_effective_limit(int limit) -> int {
+    if (limit < 1) {
+        return 1
+    }
+    return limit
+}
+
+fun engine_bool_text(bool value) -> string {
+    if (value) {
+        return "true"
+    }
+    return "false"
+}
+
+fun engine_log_message(string text) -> string {
+    var string q = util_dquote()
+    return "{" + q + "kind" + q + ":" + q + "log" + q + "," + q + "message" + q + ":" + json.escape_string(copy(text)) + "}"
+}
+
+fun engine_lag_message(int lag_ms) -> string {
+    var string q = util_dquote()
+    return "{" + q + "kind" + q + ":" + q + "lag" + q + "," + q + "ms" + q + ":" + fmt.i64_to_str(lag_ms) + "}"
+}
+
+fun engine_lyrics_request(string name, string artist) -> string {
+    var string q = util_dquote()
+    var string message = "{" + q + "kind" + q + ":" + q + "lyrics_request" + q + "," + q + "name" + q + ":" + json.escape_string(copy(name))
+    return message + "," + q + "artist" + q + ":" + json.escape_string(copy(artist)) + "}"
+}
+
+fun engine_lyrics_message(string name, string artist, bool found, string source, string lines_json) -> string {
+    var string q = util_dquote()
+    var string message = "{" + q + "kind" + q + ":" + q + "lyrics" + q + "," + q + "name" + q + ":" + json.escape_string(copy(name))
+    message = message + "," + q + "artist" + q + ":" + json.escape_string(copy(artist))
+    message = message + "," + q + "found" + q + ":" + (found ? "true" : "false")
+    message = message + "," + q + "source" + q + ":" + json.escape_string(copy(source))
+    return message + "," + q + "lines" + q + ":" + copy(lines_json) + "}"
+}
+
+fun engine_state_message(string kind, string track_id, string name, string artist, int progress_ms, bool has_progress, int duration_ms) -> string {
+    var string q = util_dquote()
+    var string message = "{" + q + "kind" + q + ":" + json.escape_string(copy(kind))
+    message = message + "," + q + "track_id" + q + ":" + json.escape_string(copy(track_id))
+    message = message + "," + q + "name" + q + ":" + json.escape_string(copy(name))
+    message = message + "," + q + "artist" + q + ":" + json.escape_string(copy(artist))
+    message = message + "," + q + "progress" + q + ":" + fmt.i64_to_str(progress_ms)
+    message = message + "," + q + "has_progress" + q + ":" + (has_progress ? "true" : "false")
+    return message + "," + q + "duration" + q + ":" + fmt.i64_to_str(duration_ms) + "}"
+}
+
+fun engine_encode_action(view EngineAction action) -> string {
+    var string q = util_dquote()
+    var string body = q + "kind" + q + ":" + json.escape_string(copy(action.kind))
+    body = body + "," + q + "text" + q + ":" + json.escape_string(copy(action.text))
+    body = body + "," + q + "emoji" + q + ":" + json.escape_string(copy(action.emoji))
+    return "{" + body + "}"
+}
+
+fun engine_apply_update(view mut StateAppContext ctx, view string message) -> bool {
+    var string kind = util_json_string(json.get(copy(message), "kind"))
+    if (kind == "log") {
+        log_write(copy(ctx.config_dir), util_json_string(json.get(copy(message), "message")))
+        return false
+    }
+    if (kind == "lag") {
+        ctx.state.tracker.lastfm_lag = lyrics_json_int(json.get(copy(message), "ms"))
+        return false
+    }
+    if (kind == "latency") {
+        ctx.state.tracker.add_latency(lyrics_json_int(json.get(copy(message), "ms")), engine_effective_limit(ctx.settings.timing.autooffset))
+        return false
+    }
+    if (kind == "stopped") {
+        ctx.state.playback.is_playing = false
+        return false
+    }
+    if (kind == "lyrics") {
+        return engine_apply_lyrics(ctx, copy(message))
+    }
+    if (kind != "state") {
+        return false
+    }
+    var state = PlayerState()
+    state.track_id = util_json_string(json.get(copy(message), "track_id"))
+    state.name = connector_cleanup_title(util_json_string(json.get(copy(message), "name")))
+    state.artist = util_json_string(json.get(copy(message), "artist"))
+    state.is_playing = true
+    state.duration_ms = lyrics_json_int(json.get(copy(message), "duration"))
+    var bool has_progress = json.get(copy(message), "has_progress") == "true"
+    return engine_apply_state(ctx, state, has_progress, lyrics_json_int(json.get(copy(message), "progress")))
+}
+
+fun engine_apply_lyrics(view mut StateAppContext ctx, view string message) -> bool {
+    var pb = ctx.state.playback
+    if (json.get(copy(message), "found") != "true") {
+        if (arrays.length(pb.lyric_times) > 0) {
+            return false
+        }
+        pb.has_lyrics = false
+        pb.lyric_times = arrays.fill(0, 0)
+        pb.lyric_texts = arrays.fill("", 0)
+        ctx.state.lyric_source = "none"
+        return false
+    }
+    pb.has_lyrics = true
+    pb.current_line = StateLyricsLine()
+    pb.has_current_line = false
+    ctx.state.lyric_source = util_json_string(json.get(copy(message), "source"))
+    var stored = lyrics_lines_from_json(json.get(copy(message), "lines"))
+    pb.lyric_times = arrays.fill(0, 0)
+    pb.lyric_texts = arrays.fill("", 0)
+    for (var line in stored) {
+        arrays.push(pb.lyric_times, line.time)
+        arrays.push(pb.lyric_texts, copy(line.text))
+    }
+    return false
+}
+
+
+
+
+
+
+
+
+
+use testing
+use arrays
+
+fun vm_fill(view mut array[int] target, int n) {
+    arrays.push(target, n)
+    arrays.push(target, n * 2)
+}
+
+fun vm_fill_str(view mut array[string] target, string s) {
+    arrays.push(target, s)
+}
+
+
+
+
+
+fun vm_second(view string label, view mut array[int] target, int n) {
+    arrays.push(target, n)
+}
+
+
+fun vm_loop_push(view string label, view mut array[int] target, int n) {
+    var i = 0
+    while (i < n) {
+        arrays.push(target, i * 10)
+        i = i + 1
+    }
+}
+
+
+fun vm_loop_push_ret(view string label, view mut array[int] target, int n) -> string {
+    var body = ""
+    var i = 0
+    while (i < n) {
+        arrays.push(target, i * 10)
+        body = body + "x"
+        i = i + 1
+    }
+    return body
+}
+
+
+fun vm_loop_push_cont(view string label, view mut array[int] target, int n) -> string {
+    var body = ""
+    var i = 0
+    while (i < n) {
+        if (i == 1) {
+            i = i + 1
+            continue
+        }
+        arrays.push(target, i * 10)
+        body = body + "x"
+        i = i + 1
+    }
+    return body
+}
+
+
+
+
+
+
+
+
+test engine_pause_edge_fires_only_on_the_transition {
+    var ctx = engine_test_ctx()
+    var tracker = ctx.state.tracker
+    var pb = ctx.state.playback
+    pb.is_playing = false
+    testing.assert_true(!engine_playing_edge_to_pause(tracker, false))
+    pb.is_playing = true
+    testing.assert_true(!engine_playing_edge_to_pause(tracker, true))
+    pb.is_playing = false
+    testing.assert_true(engine_playing_edge_to_pause(tracker, false))
+    testing.assert_true(!engine_playing_edge_to_pause(tracker, false))
+    pb.is_playing = true
+    testing.assert_true(!engine_playing_edge_to_pause(tracker, true))
+    pb.is_playing = false
+    testing.assert_true(engine_playing_edge_to_pause(tracker, false))
+}
+
+test engine_never_playing_never_fires {
+    var ctx = engine_test_ctx()
+    var tracker = ctx.state.tracker
+    testing.assert_true(!engine_playing_edge_to_pause(tracker, false))
+    testing.assert_true(!engine_playing_edge_to_pause(tracker, false))
+}
+
+test engine_sending_a_line_records_last_send {
+    var ctx = engine_test_ctx()
+    ctx.config_dir = "/tmp/mewsic-engine-test"
+    var settings = ctx.settings
+    settings.timing.send_time_offset = 0
+    settings.timing.enable_autooffset = false
+    settings.view_settings.auto_clear = false
+    engine_fill_playback(ctx.state.playback, 2000)
+    testing.assert_true(ctx.state.tracker.last_send_ms < 0.0)
+    var action = engine_maybe_send_line(ctx)
+    testing.assert_true(action.kind == "update")
+    testing.assert_true(strings.contains(action.text, "hello"))
+    testing.assert_true(ctx.state.tracker.last_send_ms >= 0.0)
+    testing.assert_true(ctx.state.playback.has_current_line)
+    testing.assert_true(ctx.state.playback.current_line.time == 1500)
+    testing.assert_true(ctx.state.tracker.sent_lines[0] == 1500)
+}
+
+test engine_a_line_is_not_sent_twice {
+    var ctx = engine_test_ctx()
+    ctx.config_dir = "/tmp/mewsic-engine-test"
+    var settings = ctx.settings
+    settings.timing.send_time_offset = 0
+    settings.timing.enable_autooffset = false
+    settings.view_settings.auto_clear = false
+    engine_fill_playback(ctx.state.playback, 2000)
+    testing.assert_true(engine_maybe_send_line(ctx).kind == "update")
+    testing.assert_true(engine_maybe_send_line(ctx).kind == "none")
+}
+
+test engine_keep_alive_refreshes_last_send_on_an_expiring_status {
+    var ctx = engine_test_ctx()
+    ctx.config_dir = "/tmp/mewsic-engine-test"
+    engine_fill_playback(ctx.state.playback, 0)
+    var line = StateLyricsLine()
+    line.time = 9000
+    line.text = "still playing"
+    ctx.state.playback.current_line = line
+    ctx.state.playback.has_current_line = true
+    var stale_by = util_trunc(engine_keepalive_interval_ms / 1000) + 10
+    ctx.state.tracker.last_send_ms = time.now() / 1000.0 - stale_by
+
+    var action = engine_maybe_keep_alive(ctx)
+    testing.assert_true(action.kind == "keepalive")
+    testing.assert_true(action.text != "")
+    var elapsed = util_trunc(time.now() / 1000.0 - ctx.state.tracker.last_send_ms)
+    testing.assert_true(elapsed < 1000)
+}
+
+test engine_keep_alive_skips_within_the_refresh_window {
+    var ctx = engine_test_ctx()
+    ctx.config_dir = "/tmp/mewsic-engine-test"
+    engine_fill_playback(ctx.state.playback, 0)
+    var line = StateLyricsLine()
+    line.time = 9000
+    line.text = "still playing"
+    ctx.state.playback.current_line = line
+    ctx.state.playback.has_current_line = true
+    var before = time.now() / 1000.0 - 5.0
+    ctx.state.tracker.last_send_ms = before
+    testing.assert_true(engine_maybe_keep_alive(ctx).kind == "none")
+    testing.assert_true(ctx.state.tracker.last_send_ms == before)
+}
+
+test engine_pick_line_chooses_the_last_line_before_the_threshold {
+    var array[int] times = arrays.fill(0, 0)
+    var array[string] texts = arrays.fill("", 0)
+    arrays.push(times, 1000)
+    arrays.push(texts, "one")
+    arrays.push(times, 2000)
+    arrays.push(texts, "two")
+    arrays.push(times, 3000)
+    arrays.push(texts, "three")
+    var ctx = engine_test_ctx()
+    var tracker = ctx.state.tracker
+    var pb = ctx.state.playback
+    testing.assert_true(engine_pick_line(times, texts, 2500, tracker, pb) == 1)
+    testing.assert_true(engine_pick_line(times, texts, 1000, tracker, pb) == -1)
+    testing.assert_true(engine_pick_line(times, texts, 4000, tracker, pb) == 2)
+}
+
+test engine_pick_line_skips_empty_and_sent_lines {
+    var array[int] times = arrays.fill(0, 0)
+    var array[string] texts = arrays.fill("", 0)
+    arrays.push(times, 1000)
+    arrays.push(texts, "   ")
+    arrays.push(times, 2000)
+    arrays.push(texts, "sent")
+    arrays.push(times, 3000)
+    arrays.push(texts, "fresh")
+    var ctx = engine_test_ctx()
+    var tracker = ctx.state.tracker
+    var pb = ctx.state.playback
+    arrays.push(tracker.sent_lines, 2000)
+    testing.assert_true(engine_pick_line(times, texts, 2500, tracker, pb) == -1)
+    testing.assert_true(engine_pick_line(times, texts, 3500, tracker, pb) == 2)
+}
+
+test engine_offset_uses_measured_latency_when_autooffset_is_on {
+    var settings = ConfigSettings()
+    var tracker = StateTracker()
+    settings.timing.enable_autooffset = false
+    settings.timing.send_time_offset = 500
+    testing.assert_true(engine_offset(settings, tracker) == 500)
+    settings.timing.enable_autooffset = true
+    tracker.add_latency(200, 3)
+    tracker.add_latency(400, 3)
+    testing.assert_true(engine_offset(settings, tracker) == 300 + 100)
+}
+
+test engine_offset_falls_back_to_the_default_lastfm_lag {
+    var settings = ConfigSettings()
+    var tracker = StateTracker()
+    settings.source = ConfigSource.Lastfm
+    settings.timing.enable_autooffset = false
+    settings.timing.send_time_offset = 200
+    testing.assert_true(engine_offset(settings, tracker) == engine_default_lastfm_lag_ms + 200)
+    tracker.lastfm_lag = 7000
+    testing.assert_true(engine_offset(settings, tracker) == 7200)
+}
+
+test engine_apply_state_reports_the_song_change {
+    var ctx = engine_test_ctx()
+    var state = PlayerState()
+    state.is_playing = true
+    state.duration_ms = 240000
+    state.track_id = "track-1"
+    state.name = "Song (Live)"
+    state.artist = "Artist"
+    testing.assert_true(engine_apply_state(ctx, state, true, 4200))
+    var pb = ctx.state.playback
+    testing.assert_true(pb.song_id == "track-1")
+    testing.assert_true(pb.song_name == "Song")
+    testing.assert_true(pb.song_author == "Artist")
+    testing.assert_true(pb.song_progress == 4200)
+    testing.assert_true(pb.song_duration == 240000)
+    testing.assert_true(!engine_apply_state(ctx, state, false, 0))
+}
+
+test a_later_poll_keeps_the_lyrics_of_the_track_it_reports {
+    var ctx = engine_test_ctx()
+    var state = PlayerState()
+    state.is_playing = true
+    state.duration_ms = 240000
+    state.track_id = "track-1"
+    state.name = "Song"
+    state.artist = "Artist"
+    engine_apply_state(ctx, state, true, 4200)
+    ctx.settings.view_settings.auto_clear = false
+    var q = util_dquote()
+    var lines = "[{" + q + "time" + q + ":1000," + q + "text" + q + ":" + q + "hello" + q + "}]"
+    engine_apply_lyrics(ctx, engine_lyrics_message("Song", "Artist", true, "LrcLib", lines))
+    testing.assert_true(ctx.state.playback.has_lyrics)
+
+    engine_apply_state(ctx, state, true, 5200)
+    testing.assert_true(ctx.state.playback.has_lyrics)
+    testing.assert_true(arrays.length(ctx.state.playback.lyric_times) == 1)
+    testing.assert_true(ctx.state.playback.song_progress == 5200)
+
+    var action = engine_maybe_send_line(ctx)
+    testing.assert_true(action.kind == "update")
+    testing.assert_true(ctx.state.playback.has_current_line)
+    testing.assert_true(ctx.state.playback.current_line.text == "hello")
+}
+
+test engine_tick_clears_sent_lines_when_the_song_ends {
+    var ctx = engine_test_ctx()
+    var pb = ctx.state.playback
+    pb.is_playing = true
+    pb.song_duration = 1000
+    pb.song_progress = 500
+    arrays.push(ctx.state.tracker.sent_lines, 400)
+    var action = EngineAction()
+    engine_tick(ctx, 600, action)
+    testing.assert_true(arrays.length(ctx.state.tracker.sent_lines) == 0)
+}
+
+test engine_effective_limit_is_at_least_one {
+    testing.assert_true(engine_effective_limit(0) == 1)
+    testing.assert_true(engine_effective_limit(-5) == 1)
+    testing.assert_true(engine_effective_limit(3) == 3)
+}
+
+test engine_action_round_trips_through_json {
+    var action = engine_action("update", "line \"one\"", "🎧")
+    var encoded = engine_encode_action(action)
+    testing.assert_true(json.is_valid(copy(encoded)))
+    testing.assert_true(util_json_string(json.get(copy(encoded), "kind")) == "update")
+    testing.assert_true(util_json_string(json.get(copy(encoded), "text")) == "line \"one\"")
+    testing.assert_true(util_json_string(json.get(copy(encoded), "emoji")) == "🎧")
+}
+
+test engine_messages_are_valid_json {
+    testing.assert_true(json.is_valid(engine_log_message("hi")))
+    testing.assert_true(json.is_valid(engine_lag_message(1200)))
+    testing.assert_true(json.is_valid(engine_lyrics_request("S", "A")))
+    testing.assert_true(util_json_string(json.get(engine_lyrics_request("S", "A"), "kind")) == "lyrics_request")
+    testing.assert_true(json.is_valid(engine_lyrics_message("S", "A", true, "LrcLib", "[]")))
+    testing.assert_true(json.is_valid(engine_state_message("state", "t", "S", "A", 10, true, 20)))
+}
+
+test engine_apply_update_reads_a_polled_state {
+    var ctx = engine_test_ctx()
+    var message = engine_state_message("state", "t1", "Song (Live)", "Artist", 4200, true, 240000)
+    testing.assert_true(engine_apply_update(ctx, message))
+    var pb = ctx.state.playback
+    testing.assert_true(pb.song_id == "t1")
+    testing.assert_true(pb.song_name == "Song")
+    testing.assert_true(pb.song_progress == 4200)
+    testing.assert_true(pb.is_playing)
+    testing.assert_true(pb.song_duration == 240000)
+}
+
+test engine_apply_update_records_latency_and_lag {
+    var ctx = engine_test_ctx()
+    ctx.settings.timing.autooffset = 3
+    testing.assert_true(!engine_apply_update(ctx, engine_lag_message(4200)))
+    testing.assert_true(ctx.state.tracker.lastfm_lag == 4200)
+    var string q = util_dquote()
+    var latency = "{" + q + "kind" + q + ":" + q + "latency" + q + "," + q + "ms" + q + ":250}"
+    engine_apply_update(ctx, copy(latency))
+    testing.assert_true(ctx.state.tracker.last_latency == 250)
+    testing.assert_true(ctx.state.tracker.avg_latency() == 250)
+}
+
+test engine_apply_update_marks_stopped_and_logs {
+    var ctx = engine_test_ctx()
+    ctx.state.playback.is_playing = true
+    testing.assert_true(!engine_apply_update(ctx, engine_state_message("stopped", "", "", "", 0, false, 0)))
+    testing.assert_true(!ctx.state.playback.is_playing)
+
+    ctx.config_dir = "/tmp/mewsic-engine-log"
+    sys.mkdir(ctx.config_dir)
+    engine_apply_update(ctx, engine_log_message("hello"))
+    var raw = sys.read(ctx.config_dir + "/log.txt")
+    testing.assert_true(strings.contains(copy(raw), "hello"))
+    sys.rm(ctx.config_dir + "/log.txt")
+}
+
+test engine_apply_update_handles_lyrics_messages {
+    var ctx = engine_test_ctx()
+    var q = util_dquote()
+    var lines = "[{" + q + "time" + q + ":1000," + q + "text" + q + ":" + q + "hello" + q + "}]"
+    engine_apply_update(ctx, engine_lyrics_message("S", "A", true, "LrcLib", lines))
+    testing.assert_true(ctx.state.playback.has_lyrics)
+    testing.assert_true(ctx.state.lyric_source == "LrcLib")
+    testing.assert_true(arrays.length(ctx.state.playback.lyric_times) == 1)
+    testing.assert_true(ctx.state.playback.lyric_times[0] == 1000)
+    testing.assert_true(ctx.state.playback.lyric_texts[0] == "hello")
+
+    engine_apply_update(ctx, engine_lyrics_message("S", "A", false, "none", "[]"))
+    testing.assert_true(ctx.state.playback.has_lyrics)
+    testing.assert_true(ctx.state.lyric_source == "LrcLib")
+    testing.assert_true(arrays.length(ctx.state.playback.lyric_times) == 1)
+
+    var ctx2 = engine_test_ctx()
+    engine_apply_update(ctx2, engine_lyrics_message("S", "A", false, "none", "[]"))
+    testing.assert_true(!ctx2.state.playback.has_lyrics)
+    testing.assert_true(ctx2.state.lyric_source == "none")
+}
+
+test engine_push_status_without_a_token_does_nothing {
+    var state = EngineStatusState()
+    state.token = ""
+    var report = engine_push_status(state, engine_encode_action(engine_action("update", "line", "")))
+    testing.assert_true(report == "")
+    testing.assert_true(!state.has_original)
+}
+
+test engine_restore_status_is_a_no_op_without_a_capture {
+    var state = EngineStatusState()
+    state.has_original = false
+    engine_restore_status(state)
+    testing.assert_true(!state.has_original)
+}
+
+test view_mut_array_param_shares_the_caller_array {
+    var array[int] xs = arrays.fill(0, 0)
+    vm_fill(xs, 7)
+    testing.assert_true(arrays.length(xs) == 2)
+    testing.assert_true(xs[0] == 7)
+    testing.assert_true(xs[1] == 14)
+}
+
+test view_mut_string_array_param_shares_the_caller_array {
+    var array[string] ss = arrays.fill("", 0)
+    vm_fill_str(ss, "hi")
+    testing.assert_true(arrays.length(ss) == 1)
+    testing.assert_true(ss[0] == "hi")
+}
+
+test arrays_clear_empties_the_caller_array {
+    var array[int] xs = arrays.fill(0, 0)
+    arrays.push(xs, 1)
+    arrays.push(xs, 2)
+    testing.assert_true(arrays.length(xs) == 2)
+    arrays.clear(xs)
+    testing.assert_true(arrays.length(xs) == 0)
+}
+
+test arrays_clear_empties_a_string_array {
+    var array[string] ss = arrays.fill("", 0)
+    arrays.push(ss, "a")
+    testing.assert_true(arrays.length(ss) == 1)
+    arrays.clear(ss)
+    testing.assert_true(arrays.length(ss) == 0)
+}
+
+test view_mut_array_param_in_a_later_position_still_shares {
+    var array[int] xs = arrays.fill(0, 0)
+    vm_second("x", xs, 5)
+    testing.assert_true(arrays.length(xs) == 1)
+    testing.assert_true(xs[0] == 5)
+}
+
+test view_mut_param_push_in_callee_loop {
+    var array[int] xs = arrays.fill(0, 0)
+    vm_loop_push("x", xs, 3)
+    testing.assert_true(arrays.length(xs) == 3)
+    testing.assert_true(xs[0] == 0)
+    testing.assert_true(xs[2] == 20)
+}
+
+test view_mut_param_push_in_callee_loop_with_return {
+    var array[int] xs = arrays.fill(0, 0)
+    var body = vm_loop_push_ret("hello", xs, 3)
+    testing.assert_true(body == "xxx")
+    testing.assert_true(arrays.length(xs) == 3)
+    testing.assert_true(xs[2] == 20)
+}
+
+test view_mut_param_push_with_continue {
+    var array[int] xs = arrays.fill(0, 0)
+    var body = vm_loop_push_cont("hello", xs, 3)
+    testing.assert_true(body == "xx")
+    testing.assert_true(arrays.length(xs) == 2)
+    testing.assert_true(xs[1] == 20)
+}
+
+test arrays_clear_then_push_reuses_the_array {
+    var array[int] xs = arrays.fill(0, 0)
+    arrays.push(xs, 1)
+    arrays.clear(xs)
+    arrays.push(xs, 9)
+    testing.assert_true(arrays.length(xs) == 1)
+    testing.assert_true(xs[0] == 9)
+}
+
+test arrays_clear_empties_readable_contents {
+    var array[int] xs = arrays.fill(0, 0)
+    arrays.push(xs, 1)
+    arrays.push(xs, 2)
+    arrays.clear(xs)
+    testing.assert_true(arrays.length(xs) == 0)
+}
+
+test lyrics_cache_hit_stores_lines_for_playback {
+    var ctx = engine_test_ctx()
+    ctx.config_dir = "/home/yasakei/.config/mewsic"
+    var poller = EnginePoller()
+    poller.fetcher = lyrics_fetcher_new(copy(ctx.config_dir))
+    var answer = engine_answer_lyrics_request(poller, engine_lyrics_request("What You Know", "Two Door Cinema Club"))
+    engine_apply_lyrics(ctx, copy(answer))
+    testing.assert_true(ctx.state.playback.has_lyrics)
+    testing.assert_true(arrays.length(ctx.state.playback.lyric_times) > 0)
+}

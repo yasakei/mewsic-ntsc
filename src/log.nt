@@ -1,0 +1,16 @@
+use sys
+use strings
+use "util.nt"
+
+fun log_write(view string dir, view string msg) {
+    if (dir == "") {
+        return
+    }
+    var stamp = util_iso_now_plus(0)
+    quiet [unused_variable] {
+        try {
+            sys.append(copy(dir) + "/log.txt", "[" + stamp + "] " + copy(msg) + strings.from_char_code(10))
+        } catch (e) {
+        }
+    }
+}

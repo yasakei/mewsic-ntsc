@@ -1,0 +1,46 @@
+use arrays
+use strings
+
+fun translit_chars(view string text) -> array[string] {
+    var array[string] out = arrays.fill("", 0)
+    var var_rest = strings.split(text, "")
+    var newline = strings.from_char_code(10)
+    while (!strings.is_empty(var_rest)) {
+        var at = strings.index_of(var_rest, newline, 0)
+        if (at < 0) {
+            arrays.push(out, copy(var_rest))
+            var_rest = ""
+        } else {
+            arrays.push(out, strings.substring(var_rest, 0, at))
+            var_rest = strings.substring(var_rest, at + 1, -1)
+        }
+    }
+    return out
+}
+
+fun translit_codepoint(view string ch) -> int {
+    var b0 = strings.char_code(ch, 0)
+    if (b0 < 128) { return b0 }
+    var b1 = strings.char_code(ch, 1)
+    if (b0 < 224) { return (b0 - 192) * 64 + (b1 - 128) }
+    var b2 = strings.char_code(ch, 2)
+    if (b0 < 240) { return (b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128) }
+    var b3 = strings.char_code(ch, 3)
+    return (b0 - 240) * 262144 + (b1 - 128) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+}
+
+fun translit_is_space(view string ch) -> bool {
+    return strings.trim(ch) == ""
+}
+
+fun translit_from_codepoint(int code) -> string {
+    if (code >= 0 && code < 128) { return strings.from_char_code(code) }
+    if (code == 10) { return strings.from_char_code(10) }
+    if (code == 8204) { return "‌" }
+    if (code == 8205) { return "‍" }
+    if (code == 2511) { return "ৈ" }
+    if (code == 2524) { return "ড়" }
+    if (code == 2525) { return "ঢ়" }
+    if (code == 2527) { return "য়" }
+    return ""
+}

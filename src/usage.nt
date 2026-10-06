@@ -1,0 +1,92 @@
+use sys
+use os
+use strings
+use json
+use crypto
+use process
+use http
+use testing
+use "log.nt"
+use "util.nt"
+use "config.nt"
+
+fun usage_report_in_background(string config_dir, bool enabled) {
+    if (!enabled) {
+        return
+    }
+    var payload = usage_payload(copy(config_dir))
+    go {
+        try {
+            http.post("https://mewsic.yasakei.dev/v1/usage", copy(payload))
+        } catch (e) {
+            log_write(config_dir, "telemetry report failed: " + e)
+        }
+    }
+}
+
+fun usage_payload(string config_dir) -> string {
+    var q = util_dquote()
+    var body = q + "install_id" + q + ":" + json.escape_string(usage_install_id(copy(config_dir)))
+    body = body + "," + q + "os" + q + ":" + json.escape_string(util_os())
+    body = body + "," + q + "arch" + q + ":" + json.escape_string(util_arch())
+    body = body + "," + q + "version" + q + ":" + json.escape_string(mewsic_version)
+    return "{" + body + "}"
+}
+
+fun usage_enabled(view ConfigSettings s) -> bool {
+    if (os.getenv("MEWSIC_NO_TELEMETRY") != "") {
+        return false
+    }
+    return s.usage.enabled
+}
+
+fun usage_install_id(view string dir) -> string {
+    var path = copy(dir) + "/install_id"
+    var existing = ""
+    quiet [unused_variable] {
+        try {
+            existing = sys.read(path)
+        } catch (e) {
+            existing = ""
+        }
+    }
+    existing = strings.trim(existing)
+    if (existing != "") {
+        return existing
+    }
+    var id = "me" + crypto.hex_encode(crypto.random_bytes(16))
+    quiet [unused_variable] {
+        try {
+            sys.write(path, id)
+        } catch (e) {
+        }
+    }
+    return id
+}
+
+test usage_install_id_stable_and_anonymous {
+    var dir = "/tmp/mewsic-usage-test"
+    sys.mkdir(dir)
+    var id1 = usage_install_id(dir)
+    var id2 = usage_install_id(dir)
+    testing.assert_true(id1 == id2)
+    testing.assert_true(strings.starts_with(id1, "me"))
+    testing.assert_true(strings.length(id1) > 32)
+    sys.rm(dir + "/install_id")
+}
+
+test usage_telemetry_defaults_to_enabled {
+    var s = ConfigSettings()
+    testing.assert_true(s.usage.enabled)
+    testing.assert_true(usage_enabled(s))
+}
+
+test usage_payload_is_valid_json {
+    var dir = "/tmp/mewsic-usage-payload"
+    sys.mkdir(dir)
+    var payload = usage_payload(copy(dir))
+    testing.assert_true(json.is_valid(payload))
+    testing.assert_true(json.get(copy(payload), "version") == util_dquote() + mewsic_version + util_dquote())
+    testing.assert_true(strings.length(json.get(copy(payload), "os")) > 2)
+    sys.rm(dir + "/install_id")
+}

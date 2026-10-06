@@ -1,0 +1,400 @@
+use sys
+use os
+use io
+use time
+use strings
+use arrays
+use testing
+use "log.nt"
+use "util.nt"
+use "credential.nt"
+use "autostart.nt"
+use "config.nt"
+use "state.nt"
+use "sync.nt"
+use "lyrics.nt"
+use "connector.nt"
+use "lastfm.nt"
+use "engine.nt"
+use "usage.nt"
+use "net.nt"
+use "tui.nt"
+use "update.nt"
+use "web.nt"
+use net
+use fmt
+
+static const var string main_help = "mewsic — keep your Discord status in sync with the song you're playing.
+
+USAGE:
+  mewsic                    Run the dashboard + engine
+  mewsic web                Run the engine with the web panel enabled
+  mewsic background         Run detached in the background — keeps playing
+                            after this terminal closes
+  mewsic setup              Interactive first-time setup
+  mewsic settings           Edit settings interactively
+  mewsic stop               Stop the running foreground instance
+  mewsic kill background    Stop the background instance
+  mewsic kill autostart     Disable autostart (start-on-login)
+  mewsic update             Check for and install the latest release
+  mewsic update check       Check for a newer release without installing
+  mewsic uninstall          Disable autostart and remove the mewsic binary
+  mewsic version            Print version
+
+ENVIRONMENT:
+  MEWSIC_CONFIG_DIR     Override the config directory (default ~/.config/mewsic)
+"
+
+static const var string main_version = "0.1.0"
+
+static const var int main_tick_ms = 16
+
+fun main() {
+    var array[string] args = sys.args()
+    var command = main_command(args)
+    var sub = main_subcommand(args)
+
+    if (command == "help" || command == "--help" || command == "-h") {
+        say(main_help)
+        return
+    }
+    if (command == "version" || command == "--version" || command == "-V") {
+        say("mewsic " + main_version)
+        return
+    }
+    if (command == "run") {
+        main_run(main_args_flag(args, "--web"))
+        return
+    }
+    if (command == "web") {
+        main_run(true)
+        return
+    }
+    if (command == "stop") {
+        main_stop()
+        return
+    }
+    if (command == "background") {
+        main_background()
+        return
+    }
+    if (command == "setup") {
+        main_setup()
+        return
+    }
+    if (command == "settings") {
+        main_settings()
+        return
+    }
+    if (command == "romanize") {
+        main_romanize(sub)
+        return
+    }
+    if (command == "kill") {
+        main_kill(sub)
+        return
+    }
+    if (command == "uninstall") {
+        main_uninstall()
+        return
+    }
+    if (command == "update") {
+        var ctx = main_init_context()
+        if (sub == "check") {
+            say(update_check_only(ctx))
+            return
+        }
+        say(update_run(ctx))
+        return
+    }
+    main_warn("unknown command: " + command)
+    say(main_help)
+    sys.exit(2)
+}
+
+fun main_command(view array[string] args) -> string {
+    if (arrays.length(args) > 1) {
+        return copy(args[1])
+    }
+    return "run"
+}
+
+fun main_subcommand(view array[string] args) -> string {
+    if (arrays.length(args) > 2) {
+        return copy(args[2])
+    }
+    return ""
+}
+
+fun main_warn(string message) {
+    io.write(io.stderr(), message + strings.from_char_code(10))
+}
+
+fun main_args_flag(view array[string] args, string flag) -> bool {
+    for (var arg in args) {
+        if (arg == flag) {
+            return true
+        }
+    }
+    return false
+}
+
+fun main_init_context() -> StateAppContext {
+    var ctx = StateAppContext()
+    ctx.config_dir = config_dir()
+    quiet [unused_variable] {
+        try {
+            sys.mkdir(copy(ctx.config_dir))
+        } catch (e) {
+            main_warn("could not create config dir " + copy(ctx.config_dir))
+        }
+    }
+    ctx.settings = config_load(copy(ctx.config_dir))
+    ctx.has_table = false
+    return ctx
+}
+
+fun main_run(bool with_web) {
+    var ctx = main_init_context()
+    var interactive = tui_supported()
+    usage_report_in_background(copy(ctx.config_dir), usage_enabled(ctx.settings))
+
+    if (!with_web && interactive) {
+    }
+
+    var ui = 0
+    if (interactive) {
+        ui = tui_open()
+    }
+
+    var needs_setup = main_needs_setup(ctx)
+    if (needs_setup && interactive && !with_web) {
+        if (!tui_wizard(ctx, ui)) {
+            main_close(ui, interactive)
+            return
+        }
+    }
+
+    if (with_web) {
+        if (web_start(ctx)) {
+            say("web panel listening on " + web_url())
+        } else {
+            main_warn("the web panel could not bind port " + fmt.i64_to_str(web_port()))
+        }
+    }
+
+    var poller = main_build_poller(ctx)
+    var sender = EngineStatusState()
+    sender.token = copy(ctx.settings.token)
+    sender.latency_limit = 1
+
+    var int last_tick = util_trunc(time.now())
+    var int last_render = 0
+    var action = EngineAction()
+    var running = true
+    while (running) {
+        if (interactive) {
+            var action = tui_poll_action(ui, 16)
+            if (action == "quit") {
+                running = false
+            }
+            if (action == "settings") {
+                main_close(ui, interactive)
+                main_settings_with(ctx)
+                ui = tui_open()
+            }
+            if (action == "panel") {
+                web_start(ctx)
+                main_show_panel_hint()
+            }
+        }
+        var int now = util_trunc(time.now())
+        var int delta = now - last_tick
+        if (delta < 0) {
+            delta = 0
+        }
+        last_tick = now
+
+        main_pump_messages(poller, ctx)
+        engine_tick(ctx, delta, action)
+        main_send_action(ctx, sender, action)
+        if (ctx.web.running) {
+            web_poll(ctx, 10)
+        }
+
+        if (interactive) {
+            if (now - last_render >= 250) {
+                last_render = now
+                tui_draw(ui, ctx)
+            }
+            if (delta < main_tick_ms) {
+                sys.sleep(main_tick_ms - delta)
+            }
+        } else {
+            sys.sleep(250.0)
+        }
+    }
+
+    web_stop(ctx)
+    engine_restore_status(sender)
+    main_close(ui, interactive)
+    log_write(copy(ctx.config_dir), "mewsic stopped")
+}
+
+fun main_close(int ui, bool interactive) {
+    if (interactive) {
+        tui_close(ui)
+    }
+}
+
+fun main_pump_messages(view mut EnginePoller poller, view mut StateAppContext ctx) {
+    var array[string] messages = engine_poll_once(poller)
+    for (var message in messages) {
+        var kind = util_json_string(json.get(copy(message), "kind"))
+        if (kind == "lyrics_request") {
+            var answer = engine_answer_lyrics_request(poller, copy(message))
+            engine_apply_lyrics(ctx, copy(answer))
+            continue
+        }
+        engine_apply_update(ctx, copy(message))
+    }
+}
+
+fun main_send_action(view mut StateAppContext ctx, view mut EngineStatusState sender, view EngineAction action) {
+    if (action.kind == "none") {
+        return
+    }
+    var report = engine_push_status(sender, engine_encode_action(action))
+    if (report != "") {
+        engine_apply_update(ctx, report)
+    }
+}
+
+fun main_build_poller(view StateAppContext ctx) -> EnginePoller {
+    var poller = EnginePoller()
+    poller.config_dir = copy(ctx.config_dir)
+    poller.source_setting = ctx.settings.source
+    poller.api_key = copy(ctx.settings.lastfm.api_key)
+    poller.username = copy(ctx.settings.lastfm.username)
+    poller.fetcher = lyrics_fetcher_new(copy(ctx.config_dir))
+    if (ctx.settings.token != "") {
+        poller.discord_token = copy(ctx.settings.token)
+    } else {
+        poller.discord_token = credential_load_token(copy(ctx.config_dir))
+    }
+    return poller
+}
+
+fun main_needs_setup(view StateAppContext ctx) -> bool {
+    if (ctx.settings.token != "") {
+        return false
+    }
+    return ctx.settings.lastfm.api_key == "" || ctx.settings.lastfm.username == ""
+}
+
+fun main_show_panel_hint() {
+    say("the web panel is at " + web_url() + " (ctrl+b)")
+}
+
+fun main_stop() {
+    var path = config_dir() + "/mewsic.pid"
+    if (!sys.exists(copy(path))) {
+        main_warn("no running foreground instance")
+        return
+    }
+    quiet [unused_variable] {
+        try {
+            sys.rm(copy(path))
+        } catch (e) {
+        }
+    }
+    say("stopped")
+}
+
+fun main_kill(string what) {
+    if (what == "background") {
+        var path = config_dir() + "/background.pid"
+        if (!sys.exists(copy(path))) {
+            main_warn("no background instance")
+            return
+        }
+        quiet [unused_variable] {
+            try {
+                sys.rm(copy(path))
+            } catch (e) {
+            }
+        }
+        say("stopped the background instance")
+        return
+    }
+    if (what == "autostart") {
+        autostart_apply(config_dir(), false)
+        say("autostart disabled")
+        return
+    }
+    main_warn("usage: mewsic kill [background|autostart]")
+}
+
+fun main_background() {
+    var dir = config_dir()
+    if (!sys.exists(copy(dir) + "/mewsic.pid")) {
+        say("no foreground instance to detach")
+        return
+    }
+    say("background mode is not available in the Neutron port yet")
+}
+
+fun main_uninstall() {
+    autostart_apply(config_dir(), false)
+    say("autostart disabled; remove the mewsic binary yourself")
+}
+
+fun main_setup() {
+    var ctx = main_init_context()
+    if (!tui_supported()) {
+        main_warn("setup needs a terminal")
+        return
+    }
+    var ui = tui_open()
+    if (!tui_wizard(ctx, ui)) {
+        tui_close(ui)
+        return
+    }
+    tui_close(ui)
+    say("setup complete")
+}
+
+fun main_settings() {
+    var ctx = main_init_context()
+    if (!tui_supported()) {
+        main_warn("settings needs a terminal")
+        return
+    }
+    main_settings_with(ctx)
+}
+
+fun main_settings_with(view mut StateAppContext ctx) {
+    var ui = tui_open()
+    tui_settings_editor(ctx, ui)
+    tui_close(ui)
+    config_save(ctx.settings, copy(ctx.config_dir))
+}
+
+fun main_romanize(string input) {
+    if (input == "") {
+        say("usage: mewsic romanize <text>")
+        return
+    }
+    var table = engine_table(config_dir())
+    var out = romanize_romanize(input, table)
+    say(out)
+}
+
+test main_command_reads_process_arguments {
+    var array[string] args = arrays.fill("", 0)
+    arrays.push(args, "mewsic")
+    arrays.push(args, "web")
+    arrays.push(args, "panel")
+    testing.assert_true(main_command(args) == "web")
+    testing.assert_true(main_subcommand(args) == "panel")
+}

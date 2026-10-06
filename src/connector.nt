@@ -1,0 +1,353 @@
+use strings
+use arrays
+use json
+use http
+use fmt
+use testing
+use "util.nt"
+use "net.nt"
+use "lyrics.nt"
+
+static const var int connector_status_expiry_secs = 60
+static const var string connector_discord_api = "https://discord.com/api/v10"
+static const var string connector_spotify_api = "https://api.spotify.com/v1"
+
+class PlayerState {
+    var bool is_playing
+    var int progress_ms
+    var int duration_ms
+    var string track_id
+    var string name
+    var string artist
+    fun init() {
+        this.is_playing = false
+        this.progress_ms = 0
+        this.duration_ms = 0
+        this.track_id = ""
+        this.name = ""
+        this.artist = ""
+    }
+}
+
+class FetchError {
+    var bool unauthorized
+    var bool timed_out
+    var string message
+    fun init() {
+        this.unauthorized = false
+        this.timed_out = false
+        this.message = ""
+    }
+}
+
+fun connector_error(string message) -> FetchError {
+    var err = FetchError()
+    err.message = copy(message)
+    return err
+}
+
+fun connector_unauthorized() -> FetchError {
+    var err = FetchError()
+    err.unauthorized = true
+    err.message = "unauthorized"
+    return err
+}
+
+fun connector_request(string method, string url, string body, string authorization) -> (FetchError, string) {
+    var headers = LyricsHeaders()
+    if (authorization != "") {
+        headers.add("Authorization", copy(authorization))
+    }
+    headers.add("Content-Type", "application/json")
+    var options = lyrics_options(headers.to_json(), 5000)
+    var failed = false
+    var unauthorized = false
+    var text = ""
+    var failure = ""
+    var int status = 0
+    quiet [unused_variable] {
+        try {
+            var resp = http.request_full(copy(method), copy(url), copy(body), options)
+            status = http.status_code(copy(resp))
+            text = util_json_first_document(util_json_string(json.get(resp, "body")))
+            if (status < 200 || status > 299) {
+                failed = true
+                unauthorized = status == 401
+            }
+        } catch (e) {
+            failed = true
+            failure = e
+        }
+    }
+    if (failed) {
+        var err = connector_error(connector_status_text(status, copy(text), copy(failure)))
+        err.timed_out = connector_is_timeout(copy(failure))
+        err.unauthorized = unauthorized
+        return (err, "")
+    }
+    return (connector_error(""), copy(text))
+}
+
+fun connector_is_timeout(view string failure) -> bool {
+    var text = strings.lower(copy(failure))
+    if (strings.contains(copy(text), "timed out") || strings.contains(copy(text), "timeout")) {
+        return true
+    }
+    if (strings.contains(copy(text), "temporarily unavailable")) {
+        return true
+    }
+    return strings.contains(copy(text), "os error 11")
+}
+
+fun connector_status_text(int status, view string body, view string failure) -> string {
+    if (status == 0) {
+        if (failure != "") {
+            return "request failed: " + copy(failure)
+        }
+        return "request failed"
+    }
+    var text = connector_first_line(body)
+    if (text == "" || text == "null") {
+        return "HTTP " + fmt.i64_to_str(status)
+    }
+    return "HTTP " + fmt.i64_to_str(status) + ": " + text
+}
+
+fun connector_first_line(view string body) -> string {
+    var text = strings.trim(copy(body))
+    var at = strings.index_of(copy(text), strings.from_char_code(10), 0)
+    if (at >= 0) {
+        text = strings.substring(copy(text), 0, at)
+    }
+    if (strings.length(copy(text)) > 120) {
+        text = strings.substring(copy(text), 0, 120)
+    }
+    return copy(text)
+}
+
+fun connector_fetch_spotify_token(view string discord_token) -> (FetchError, string) {
+    var url = connector_discord_api + "/users/@me/connections"
+    var (err, body) = connector_request("GET", copy(url), "", copy(discord_token))
+    if (err.message != "" || err.unauthorized) {
+        return (err, "")
+    }
+    if (!util_json_is_array(copy(body))) {
+        return (connector_error("unexpected response from " + copy(url) + ": " + connector_first_line(copy(body))), "")
+    }
+    var connections = util_json_array(copy(body))
+    var i = 0
+    while (i < arrays.length(connections)) {
+        if (util_json_string(json.get(connections[i], "type")) == "spotify") {
+            var token = util_json_string(json.get(connections[i], "access_token"))
+            if (token != "") {
+                return (connector_error(""), token)
+            }
+        }
+        i = i + 1
+    }
+    return (connector_error("no Spotify account connected to Discord"), "")
+}
+
+fun connector_fetch_player(view string spotify_token) -> (FetchError, PlayerState, bool) {
+    var state = PlayerState()
+    var url = connector_spotify_api + "/me/player"
+    var (err, body) = connector_request("GET", url, "", "Bearer " + copy(spotify_token))
+    if (err.message != "" || err.unauthorized) {
+        return (err, state, false)
+    }
+    if (body == "") {
+        return (connector_error(""), state, false)
+    }
+    if (!json.is_valid(copy(body))) {
+        return (connector_error("unexpected player response"), state, false)
+    }
+    var item = json.get(copy(body), "item")
+    if (item == "null" || item == "") {
+        return (connector_error(""), state, false)
+    }
+    state.is_playing = json.get(copy(body), "is_playing") == "true"
+    state.progress_ms = lyrics_json_int(json.get(copy(body), "progress_ms"))
+    state.duration_ms = lyrics_json_int(json.get(copy(item), "duration_ms"))
+    state.track_id = util_json_string(json.get(item, "id"))
+    state.name = util_json_string(json.get(copy(item), "name"))
+    var artists_text = json.get(copy(item), "artists")
+    if (!util_json_is_array(copy(artists_text))) {
+        return (connector_error("unexpected player response: " + connector_first_line(copy(body))), state, true)
+    }
+    var artists = util_json_array(copy(artists_text))
+    if (arrays.length(artists) > 0) {
+        state.artist = util_json_string(json.get(copy(artists[0]), "name"))
+    }
+    return (connector_error(""), state, true)
+}
+
+fun connector_fetch_status(view string discord_token) -> (FetchError, string) {
+    var url = connector_discord_api + "/users/@me/settings"
+    var (err, body) = connector_request("GET", copy(url), "", copy(discord_token))
+    if (err.message != "" || err.unauthorized) {
+        return (err, "")
+    }
+    if (!json.is_valid(copy(body))) {
+        return (connector_error("unexpected settings response"), "")
+    }
+    var status = json.get(copy(body), "custom_status")
+    if (status == "null") {
+        return (connector_error(""), "null")
+    }
+    return (connector_error(""), copy(status))
+}
+
+fun connector_patch_settings(view string discord_token, view string custom_status) -> FetchError {
+    var url = connector_discord_api + "/users/@me/settings"
+    var q = util_dquote()
+    var wrapped = "{" + q + "custom_status" + q + ":" + copy(custom_status) + "}"
+    var (err, _) = connector_request("PATCH", url, wrapped, copy(discord_token))
+    return err
+}
+
+fun connector_parse_emoji(view string emoji) -> (string, string) {
+    var trimmed = strings.trim(copy(emoji))
+    if (trimmed == "") {
+        return ("", "")
+    }
+    if (strings.starts_with(copy(trimmed), "<")) {
+        var inner = strings.substring(trimmed, 1, -1)
+        if (strings.ends_with(copy(inner), ">")) {
+            inner = strings.substring(inner, 0, strings.length(copy(inner)) - 1)
+        }
+        if (strings.starts_with(copy(inner), "a:")) {
+            inner = strings.substring(inner, 2, -1)
+        }
+        while (strings.starts_with(copy(inner), ":")) {
+            inner = strings.substring(inner, 1, -1)
+        }
+        var colon = strings.index_of(copy(inner), ":", 0)
+        if (colon != -1) {
+            var name = strings.substring(inner, 0, colon)
+            var id = strings.substring(inner, colon + 1, -1)
+            if (connector_is_custom_emoji_id(name, id)) {
+                return (name, id)
+            }
+        }
+    }
+    var colon = strings.index_of(copy(trimmed), ":", 0)
+    if (colon != -1) {
+        var name = strings.substring(trimmed, 0, colon)
+        var id = strings.substring(trimmed, colon + 1, -1)
+        if (connector_is_custom_emoji_id(name, id)) {
+            return (name, id)
+        }
+    }
+    return (trimmed, "")
+}
+
+fun connector_is_custom_emoji_id(view string name, view string id) -> bool {
+    if (name == "" || id == "") {
+        return false
+    }
+    var i = 0
+    while (i < strings.length(copy(id))) {
+        var code = strings.char_code(copy(id), i)
+        if (code < 48 || code > 57) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fun connector_patch_status(view string discord_token, view string text, view string emoji) -> FetchError {
+    var q = util_dquote()
+    var expires = "null"
+    if (text != "") {
+        expires = json.escape_string(util_iso_now_plus(connector_status_expiry_secs))
+    }
+    var (emoji_name, emoji_id) = connector_parse_emoji(copy(emoji))
+    var emoji_name_json = "null"
+    if (emoji_name != "") {
+        emoji_name_json = json.escape_string(copy(emoji_name))
+    }
+    var emoji_id_json = "null"
+    if (emoji_id != "") {
+        emoji_id_json = json.escape_string(copy(emoji_id))
+    }
+    var status = "{" + q + "text" + q + ":" + json.escape_string(copy(text))
+    status = status + "," + q + "emoji_id" + q + ":" + copy(emoji_id_json)
+    status = status + "," + q + "emoji_name" + q + ":" + copy(emoji_name_json)
+    status = status + "," + q + "expires_at" + q + ":" + copy(expires) + "}"
+    return connector_patch_settings(copy(discord_token), copy(status))
+}
+
+fun connector_validate_token(view string token) -> bool {
+    var url = connector_discord_api + "/users/@me"
+    var valid = false
+    quiet [unused_variable] {
+        try {
+            var resp = http.request_full("GET", url, "", lyrics_options("{}", 5000))
+            valid = http.status_code(copy(resp)) == 200
+        } catch (e) {
+            valid = false
+        }
+    }
+    return valid
+}
+
+fun connector_cleanup_title(view string title) -> string {
+    var trimmed = strings.trim(copy(title))
+    var at = strings.index_of(copy(trimmed), " (", 0)
+    if (at == -1) {
+        return trimmed
+    }
+    return strings.trim(strings.substring(trimmed, 0, at))
+}
+
+test connector_unicode_emoji_has_no_id {
+    var (name, id) = connector_parse_emoji("🎧")
+    testing.assert_true(name == "🎧")
+    testing.assert_true(id == "")
+}
+
+test connector_server_emoji_mention_is_split {
+    var (name, id) = connector_parse_emoji("<:pepesad:812345678901234567>")
+    testing.assert_true(name == "pepesad")
+    testing.assert_true(id == "812345678901234567")
+}
+
+test connector_animated_server_emoji_is_split {
+    var (name, id) = connector_parse_emoji("<a:pepeDance:998877665544332211>")
+    testing.assert_true(name == "pepeDance")
+    testing.assert_true(id == "998877665544332211")
+}
+
+test connector_bare_name_id_is_split {
+    var (name, id) = connector_parse_emoji("pepesad:812345678901234567")
+    testing.assert_true(name == "pepesad")
+    testing.assert_true(id == "812345678901234567")
+}
+
+test connector_empty_emoji_is_empty {
+    var (name, id) = connector_parse_emoji("")
+    testing.assert_true(name == "")
+    testing.assert_true(id == "")
+    var (name2, id2) = connector_parse_emoji("   ")
+    testing.assert_true(name2 == "")
+    testing.assert_true(id2 == "")
+}
+
+test connector_plain_text_falls_through_as_unicode {
+    var (name, id) = connector_parse_emoji("abc")
+    testing.assert_true(name == "abc")
+    testing.assert_true(id == "")
+}
+
+test connector_non_numeric_id_is_not_custom {
+    var (name, id) = connector_parse_emoji("pepesad:notanid")
+    testing.assert_true(name == "pepesad:notanid")
+    testing.assert_true(id == "")
+}
+
+test connector_cleanup_title_strips_parenthetical {
+    testing.assert_true(connector_cleanup_title("Song (Remastered 2011)") == "Song")
+    testing.assert_true(connector_cleanup_title("  Plain Song  ") == "Plain Song")
+    testing.assert_true(connector_cleanup_title("Song (Live) extra") == "Song")
+}
